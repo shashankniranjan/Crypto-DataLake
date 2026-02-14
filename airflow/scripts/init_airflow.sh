@@ -10,9 +10,9 @@ export AIRFLOW__CORE__LOAD_EXAMPLES="False"
 airflow db migrate
 
 if ! airflow users list | rg -q '^admin\s'; then
-  airflow users create \
+    airflow users create \
     --username admin \
-    --firstname Shashank \
+    --firstname Data \
     --lastname Admin \
     --role Admin \
     --email admin@local.dev \
