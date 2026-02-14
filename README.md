@@ -1,6 +1,6 @@
-﻿# Binance Minute Lake
+﻿# Crypto-Data-Scheduler
 
-Binance Minute Lake is a production-grade, Python-native ingestion framework that locks in the 58-column canonical 1-minute view of USD-M futures via a blend of WebSocket, REST, and Vision sources. It codifies the Requirements Addendum (https://github.com/???) and provides tooling for hot polling, historical repair, and reliable delivery to parquet partitions.
+Crypto-Data-Scheduler is the monorepo that houses the Binance Minute Lake ingestion system, a production-grade Python framework that locks in the 58-column canonical 1-minute view of USD-M futures via a blend of WebSocket, REST, and Vision sources. It codifies the Requirements Addendum (https://github.com/???) and delivers tooling for hot polling, historical repair, and reliable parquet partitioning.
 
 ## Highlights
 
