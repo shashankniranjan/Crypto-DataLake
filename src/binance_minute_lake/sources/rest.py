@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import time
 from datetime import UTC, datetime
+import random
+import time
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -28,6 +30,8 @@ class BinanceRESTClient:
         self._retries = max(1, retries)
         self._min_retry_delay_seconds = 1.0
         self._max_backoff_seconds = 60.0
+        self._min_interval_seconds = 0.1  # ~10 requests/sec to avoid burst 429s
+        self._last_request_monotonic: float | None = None
 
     def close(self) -> None:
         self._client.close()
@@ -37,7 +41,14 @@ class BinanceRESTClient:
 
         for attempt in range(1, self._retries + 1):
             try:
+                # simple client-side rate limiter to avoid 429 bursts
+                now = time.monotonic()
+                if self._last_request_monotonic is not None:
+                    wait = self._min_interval_seconds - (now - self._last_request_monotonic)
+                    if wait > 0:
+                        time.sleep(wait)
                 response = self._client.get(path, params=params)
+                self._last_request_monotonic = time.monotonic()
             except httpx.TransportError as exc:
                 last_transport_error = exc
                 if attempt >= self._retries:
@@ -107,6 +118,8 @@ class BinanceRESTClient:
                 self._max_backoff_seconds,
                 self._min_retry_delay_seconds * (2 ** max(attempt - 1, 0)),
             )
+        # add small jitter to desynchronize from exchange rate limits
+        delay += random.uniform(0.0, 0.3)
 
         logger.warning(
             "Retrying Binance REST request",

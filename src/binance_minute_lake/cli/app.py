@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import time
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -96,6 +98,40 @@ def run_daemon(
         pipeline.close()
 
 
+@app.command("run-forever")
+def run_forever(
+    poll_seconds: int = typer.Option(default=60, min=5, help="Aligns to minute grid; sleeps between polls"),
+) -> None:
+    """
+    Minute daemon that polls continuously and aligns sleep to the next minute boundary.
+    """
+    settings = Settings()
+    configure_logging(settings.log_level)
+
+    pipeline = MinuteIngestionPipeline(settings=settings)
+    try:
+        while True:
+            try:
+                summary = pipeline.run_once()
+                console.print(
+                    "Tick: "
+                    f"partitions={summary.partitions_committed}, "
+                    f"wm={summary.watermark_after.isoformat()}, "
+                    f"target={summary.target_horizon.isoformat()}"
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                console.print(f"[red]Tick failed:[/red] {exc}")
+            now = utc_now()
+            # align to the next poll boundary to avoid drift
+            remainder = (now.timestamp()) % poll_seconds
+            sleep_seconds = poll_seconds - remainder
+            if sleep_seconds < 0.05:
+                sleep_seconds = poll_seconds
+            time.sleep(sleep_seconds)
+    finally:
+        pipeline.close()
+
+
 @app.command("inspect-metrics-columns")
 def inspect_metrics_columns(
     trade_date: str = typer.Option(help="Date in YYYY-MM-DD format"),
@@ -118,6 +154,41 @@ def inspect_metrics_columns(
     console.print(f"Metrics columns ({len(columns)}):")
     for column in columns:
         console.print(f" - {column}")
+
+
+@app.command("materialize-duckdb")
+def materialize_duckdb(
+    db_path: Path = typer.Option(Path("data/minute.duckdb"), help="Output DuckDB file"),
+    symbol: str = typer.Option("BTCUSDT", help="Symbol to index"),
+) -> None:
+    """
+    Create/update a DuckDB database with a view over all parquet partitions for IDE browsing (DataGrip/IntelliJ).
+    """
+    try:
+        import duckdb  # type: ignore
+    except ImportError:
+        console.print("[red]duckdb not installed. Install with `pip install duckdb`.[/red]")
+        raise typer.Exit(code=1)
+
+    pattern = f"data/futures/um/minute/symbol={symbol.upper()}/year=*/month=*/day=*/hour=*/part.parquet"
+    console.print(f"Building DuckDB at {db_path} from {pattern}")
+
+    con = duckdb.connect(str(db_path))
+    con.execute(
+        f"""
+        CREATE OR REPLACE VIEW minute AS
+        SELECT
+            *,
+            regexp_extract(filename, 'symbol=([^/]+)', 1) AS symbol,
+            regexp_extract(filename, 'year=([0-9]{4})', 1) AS year,
+            regexp_extract(filename, 'month=([0-9]{2})', 1) AS month,
+            regexp_extract(filename, 'day=([0-9]{2})', 1) AS day,
+            regexp_extract(filename, 'hour=([0-9]{2})', 1) AS hour
+        FROM read_parquet('{pattern}', hive_partitioning=true);
+        """
+    )
+    con.close()
+    console.print("[green]DuckDB view `minute` ready.[/green]")
 
 
 @app.command("backfill-range")

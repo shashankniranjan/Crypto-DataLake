@@ -24,6 +24,7 @@ class MinuteTransformEngine:
         funding_rates: list[dict[str, object]],
         book_ticker_snapshots: list[dict[str, object]] | None = None,
         premium_index_snapshots: list[dict[str, object]] | None = None,
+        metrics_rows: list[dict[str, object]] | None = None,
         live_features: list[LiveMinuteFeatures] | None = None,
     ) -> pl.DataFrame:
         frame = self._minute_spine(start_minute, end_minute)
@@ -43,6 +44,7 @@ class MinuteTransformEngine:
             on="timestamp",
             how="left",
         )
+        frame = frame.join(self._metrics_frame(metrics_rows or []), on="timestamp", how="left")
         frame = frame.join(self._live_frame(live_features or []), on="timestamp", how="left")
 
         frame = self._derive_columns(frame)
@@ -251,6 +253,54 @@ class MinuteTransformEngine:
                 pl.col("next_funding_time").last().alias("next_funding_time"),
                 pl.col("premium_last_funding_rate").last().alias("premium_last_funding_rate"),
             )
+        )
+
+    def _metrics_frame(self, records: list[dict[str, object]]) -> pl.DataFrame:
+        if not records:
+            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+
+        frame = (
+            pl.DataFrame(records)
+            .with_columns(self._to_minute_timestamp("create_time"))
+            .with_columns(
+                pl.when(pl.col("count_toptrader_long_short_ratio") > 0)
+                .then(pl.col("sum_open_interest") / pl.col("count_toptrader_long_short_ratio"))
+                .otherwise(None)
+                .alias("oi_contracts"),
+                pl.when(pl.col("count_toptrader_long_short_ratio") > 0)
+                .then(pl.col("sum_open_interest_value") / pl.col("count_toptrader_long_short_ratio"))
+                .otherwise(None)
+                .alias("oi_value_usdt"),
+                pl.when(pl.col("count_toptrader_long_short_ratio") > 0)
+                .then(pl.col("sum_toptrader_long_short_ratio") / pl.col("count_toptrader_long_short_ratio"))
+                .otherwise(None)
+                .alias("top_trader_ls_ratio_acct"),
+                pl.when(pl.col("count_long_short_ratio") > 0)
+                .then(pl.col("sum_taker_long_short_vol_ratio") / pl.col("count_long_short_ratio"))
+                .otherwise(None)
+                .alias("global_ls_ratio_acct"),
+            )
+            .with_columns(
+                (pl.col("top_trader_ls_ratio_acct") - pl.col("global_ls_ratio_acct")).alias("ls_ratio_divergence")
+            )
+            .with_columns(
+                pl.lit(None).cast(pl.Float64).alias("top_trader_long_pct"),
+                pl.lit(None).cast(pl.Float64).alias("top_trader_short_pct"),
+            )
+        )
+
+        return (
+            frame.select(
+                "timestamp",
+                "oi_contracts",
+                "oi_value_usdt",
+                "top_trader_ls_ratio_acct",
+                "global_ls_ratio_acct",
+                "ls_ratio_divergence",
+                "top_trader_long_pct",
+                "top_trader_short_pct",
+            )
+            .unique(subset=["timestamp"], keep="last")
         )
 
     def _live_frame(self, records: list[LiveMinuteFeatures]) -> pl.DataFrame:

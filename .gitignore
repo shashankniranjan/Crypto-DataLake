@@ -9,7 +9,6 @@ __pycache__/
 
 # Virtual environments
 .venv/
-.venv-airflow/
 venv/
 
 # Runtime files
@@ -20,8 +19,6 @@ venv/
 *.parquet
 data/
 logs/
-airflow/logs/
-airflow/home/
 
 # IDE
 .idea/

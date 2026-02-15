@@ -13,6 +13,7 @@ from binance_minute_lake.core.enums import IngestionBand
 from binance_minute_lake.core.time_utils import floor_to_hour, floor_to_minute, iter_hours, utc_now
 from binance_minute_lake.sources.rest import BinanceRESTClient
 from binance_minute_lake.sources.vision import VisionClient
+from binance_minute_lake.sources.vision_loader import VisionLoader
 from binance_minute_lake.sources.websocket import LiveCollector, LiveMinuteFeatures
 from binance_minute_lake.state.store import SQLiteStateStore
 from binance_minute_lake.transforms.minute_builder import MinuteTransformEngine
@@ -76,6 +77,7 @@ class MinuteIngestionPipeline:
             retries=settings.rest_max_retries,
         )
         self._vision = VisionClient(base_url=settings.vision_base_url, timeout_seconds=20)
+        self._vision_loader = VisionLoader(self._vision, cache_dir=settings.root_dir.parent / ".cache" / "vision")
         self._transform = MinuteTransformEngine(max_ffill_minutes=settings.max_ffill_minutes)
         self._writer = AtomicParquetWriter(settings.root_dir, self._state_store, DQValidator())
         self._live_collector = live_collector or LiveCollector()
@@ -308,23 +310,53 @@ class MinuteIngestionPipeline:
 
         if band == IngestionBand.COLD:
             self._log_vision_availability(window_start.date())
+            klines = self._vision_loader.load_klines(self._settings.symbol, window_start, window_end_inclusive)
+            mark_klines = self._vision_loader.load_mark_price_klines(
+                self._settings.symbol, window_start, window_end_inclusive
+            )
+            index_klines = self._vision_loader.load_index_price_klines(
+                self._settings.symbol, window_start, window_end_inclusive
+            )
+            agg_trades = self._vision_loader.load_agg_trades(self._settings.symbol, window_start, window_end_inclusive)
+            book_ticker_snapshots = self._vision_loader.load_book_ticker(
+                self._settings.symbol, window_start, window_end_inclusive
+            )
+            metrics_rows = self._vision_loader.load_metrics(self._settings.symbol, window_start, window_end_inclusive)
+            premium_snapshot = self._rest.fetch_premium_index(self._settings.symbol)
+            if not klines:
+                klines = self._rest.fetch_klines(self._settings.symbol, window_start, window_end_inclusive)
+            if not agg_trades:
+                agg_trades = self._fetch_agg_trades_paginated(window_start, window_end_inclusive)
+            if not mark_klines:
+                mark_klines = self._rest.fetch_mark_price_klines(
+                    self._settings.symbol, window_start, window_end_inclusive
+                )
+            if not index_klines:
+                index_klines = self._rest.fetch_index_price_klines(
+                    self._settings.symbol, window_start, window_end_inclusive
+                )
+        else:
+            klines = self._rest.fetch_klines(self._settings.symbol, window_start, window_end_inclusive)
+            mark_klines = self._rest.fetch_mark_price_klines(
+                self._settings.symbol, window_start, window_end_inclusive
+            )
+            index_klines = self._rest.fetch_index_price_klines(
+                self._settings.symbol, window_start, window_end_inclusive
+            )
+            agg_trades = self._fetch_agg_trades_paginated(window_start, window_end_inclusive)
+            # Use a trailing bookTicker snapshot to backfill spread/imbalance for hot/warm minutes.
+            ticker_snapshot = self._rest.fetch_book_ticker(self._settings.symbol)
+            ticker_snapshot["event_time"] = int(window_end_inclusive.timestamp() * 1000)
+            book_ticker_snapshots = [ticker_snapshot]
+            metrics_rows = []  # optional: could add openInterest snapshots here if needed
+            premium_snapshot = self._rest.fetch_premium_index(self._settings.symbol)
 
-        klines = self._rest.fetch_klines(self._settings.symbol, window_start, window_end_inclusive)
-        mark_klines = self._rest.fetch_mark_price_klines(
-            self._settings.symbol, window_start, window_end_inclusive
-        )
-        index_klines = self._rest.fetch_index_price_klines(
-            self._settings.symbol, window_start, window_end_inclusive
-        )
-        agg_trades = self._fetch_agg_trades_paginated(window_start, window_end_inclusive)
         funding_rates = self._rest.fetch_funding_rate(
             self._settings.symbol,
             start_time=window_start - timedelta(hours=8),
             end_time=window_end_inclusive,
             limit=1000,
         )
-
-        premium_snapshot = self._rest.fetch_premium_index(self._settings.symbol)
         live_points = self._live_points(window_start, window_end)
 
         return self._transform.build_canonical_frame(
@@ -335,8 +367,9 @@ class MinuteIngestionPipeline:
             index_price_klines=index_klines,
             agg_trades=agg_trades,
             funding_rates=funding_rates,
-            book_ticker_snapshots=[],
+            book_ticker_snapshots=book_ticker_snapshots,
             premium_index_snapshots=[premium_snapshot],
+            metrics_rows=metrics_rows,
             live_features=live_points,
         )
 
@@ -369,6 +402,8 @@ class MinuteIngestionPipeline:
 
             if len(batch) < 1000:
                 break
+            # soften burst rate against REST 429 limits
+            time.sleep(0.05)
 
         return all_rows
 

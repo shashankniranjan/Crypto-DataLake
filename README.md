@@ -6,7 +6,7 @@
 
 - **Resilience & consistency** – schema-aware parquet commits with atomic writes, DQ gates, error retries, and ledgered partitions.
 - **Hybrid sourcing** – live WebSocket ticks, REST snapshots, and Vision daily zips combine to cover hot, warm, and cold data windows.
-- **Operational tooling** – CLI commands and Airflow DAGs to inspect state, repair gaps, and keep partitions healthy.
+- **Operational tooling** – CLI commands and daemon-friendly runners to inspect state, repair gaps, and keep partitions healthy.
 
 ## Repository layout
 
@@ -17,7 +17,6 @@
 - `src/binance_minute_lake/writer` – atomic parquet writer with schema/content hashing and validation.
 - `src/binance_minute_lake/pipeline` – orchestrator, collectors, scan/backfill helpers, and live ingestion wiring.
 - `src/binance_minute_lake/cli` – Typer-based CLI for state inspection, retries, and audit-style backfills.
-- `airflow/` – DAGs, helper scripts, and docs for running the ingestion through Airflow.
 - `tests/` – targeted unit and integration coverage for schema handling, writers, orchestrators, and validation.
 - `docs/` – implementation plan, requirements addendum, runbooks, and future work notes.
 
@@ -30,42 +29,27 @@ pip install -e .[dev]
 cp .env.example .env
 bml init-state      # create SQLite metadata and initial partitions
 bml run-once        # verify all components can run end-to-end
+PYTHONPATH=src bml run-forever  # poll every minute indefinitely (with rate limiting)
 ```
 
 ### Environment checklist
 
 1. Install system dependencies listed in `REQUIREMENTS_ADDENDUM.md` (e.g., `libpq`, `rust` for `pyarrow` builds).
-2. Copy `.env.example` to `.env` and audit values for credentials, S3 paths, and Airflow tight coupling.
+2. Copy `.env.example` to `.env` and audit values for credentials and S3 paths.
 3. Use `poetry shell` or `source .venv/bin/activate` before running `bml` commands.
-4. Validate `.airflowignore`, `state/`, and `logs/` directories are writable by the service account that will run Airflow/CLI.
+4. Validate `state/` and `logs/` directories are writable by the service account that will run the CLI.
 
 ## CLI reference
 
 - `bml run-once` – executes a single minute job, writing parquet and booking ledger entries.
 - `bml run-daemon --poll-seconds 60` – loops the minute job with configurable polling; use a process manager (systemd, supervisord) in prod.
+- `PYTHONPATH=src bml run-forever` – alignment-aware infinite poller (adds rate limiting).
 - `bml show-watermark` – displays the most recent timestamp and ledger position per symbol.
 - `bml backfill-years --years 5 [--max-missing-hours N]` – consistency scan plus repair for the requested horizon.
 - `bml backfill-range --start <ISO> --end <ISO>` – fill gaps for arbitrary ranges; schedules heavy compute work.
+- `PYTHONPATH=src bml materialize-duckdb [--db-path data/minute.duckdb]` – build/update a DuckDB view over all parquet partitions for IDE/BI inspection.
 
 Each backfill path scans existing partitions for gaps and invokes repairs for any missing hours (bounded by `--max-missing-hours` when provided).
-
-## Airflow deployment
-
-Airflow runs inside its own virtualenv (`.venv-airflow`) and connects to the SQLite metadata store. Two DAGs exist:
-
-| DAG | Purpose |
-| --- | --- |
-| `bml_minute_incremental` | Schedules the live `bml run-once` minute job. |
-| `bml_historical_backfill` | Executes the consistency backfill CLI against a configured range. |
-
-Start services from the repository root:
-
-```bash
-./airflow/scripts/start_scheduler.sh
-./airflow/scripts/start_webserver.sh
-```
-
-Once Airflow is running, visit [http://localhost:8080](http://localhost:8080) and log in with the credentials defined in `airflow/.env` (default `admin` / `admin`).
 
 ## Observability & production guidance
 
@@ -86,7 +70,7 @@ Focus areas: writer atomicity, schema validation, and orchestrator retries. Add 
 ## Maintenance
 
 - Keep dependencies in sync via `pip install -e .[dev]` and `poetry lock` if you add packages.
-- Document new pipelines or DAGs inside `docs/` and register the requirements in `REQUIREMENTS_ADDENDUM.md`.
+- Document new pipelines inside `docs/` and register the requirements in `REQUIREMENTS_ADDENDUM.md`.
 - Review `state/partition_store.sqlite` schema before modifying the ledger APIs.
 
 ## Support
