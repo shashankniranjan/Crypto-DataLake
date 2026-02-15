@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import typer
@@ -24,6 +24,128 @@ def _parse_utc_datetime(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _parse_backfill_loader_target(value: str) -> int | None:
+    normalized = value.strip().lower()
+    if normalized in {"all", "last-5-years", "last_5_years", "last5"}:
+        return None
+    try:
+        parsed_year = int(normalized)
+    except ValueError as exc:
+        raise typer.BadParameter("Enter a year like 2024 or 'all' for the last 5 years.") from exc
+    if parsed_year < 1970:
+        raise typer.BadParameter("year must be >= 1970")
+    return parsed_year
+
+
+def _compute_backfill_loader_window(
+    *,
+    year: int | None,
+    now_utc: datetime,
+    safety_lag_minutes: int,
+    lookback_years: int = 5,
+) -> tuple[datetime, datetime]:
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=UTC)
+    now_utc = now_utc.astimezone(UTC)
+    end_utc = floor_to_minute(now_utc - timedelta(minutes=safety_lag_minutes))
+
+    if year is None:
+        start_utc = floor_to_minute(end_utc - timedelta(days=365 * lookback_years))
+        return start_utc, end_utc
+
+    if year > end_utc.year:
+        raise typer.BadParameter(f"year={year} is in the future")
+
+    year_start = datetime(year, 1, 1, 0, 0, tzinfo=UTC)
+    year_end = datetime(year, 12, 31, 23, 59, tzinfo=UTC)
+    clamped_end = floor_to_minute(min(year_end, end_utc))
+    if clamped_end < year_start:
+        raise typer.BadParameter(f"year={year} has no ingestible minutes yet")
+
+    return year_start, clamped_end
+
+
+def _last_completed_utc_day_end(now_utc: datetime) -> datetime:
+    current_day_start = floor_to_minute(now_utc.astimezone(UTC)).replace(hour=0, minute=0)
+    return current_day_start - timedelta(minutes=1)
+
+
+def _duckdb_parquet_pattern(root_dir: Path, symbol: str) -> str:
+    root_resolved = root_dir.expanduser().resolve()
+    return str(
+        root_resolved
+        / "futures"
+        / "um"
+        / "minute"
+        / f"symbol={symbol.upper()}"
+        / "year=*"
+        / "month=*"
+        / "day=*"
+        / "hour=*"
+        / "part.parquet"
+    )
+
+
+def _intellij_queries_sql(symbol: str) -> str:
+    symbol_upper = symbol.upper()
+    return (
+        "-- IntelliJ / DataGrip query starter file for minute.duckdb\n"
+        "SELECT COUNT(*) AS rows_total FROM minute;\n\n"
+        "SELECT *\n"
+        f"FROM minute\nWHERE symbol = '{symbol_upper}'\n"
+        "ORDER BY timestamp DESC\nLIMIT 200;\n\n"
+        "SELECT date_trunc('day', timestamp) AS day_utc, COUNT(*) AS rows_per_day\n"
+        f"FROM minute\nWHERE symbol = '{symbol_upper}'\n"
+        "GROUP BY 1\n"
+        "ORDER BY 1 DESC\nLIMIT 30;\n"
+    )
+
+
+def _materialize_duckdb_view(
+    *,
+    db_path: Path,
+    parquet_root: Path,
+    symbol: str,
+    write_queries: bool,
+) -> tuple[Path, Path | None]:
+    try:
+        import duckdb  # type: ignore
+    except ImportError as exc:
+        console.print("[red]duckdb not installed. Install with `pip install duckdb`.[/red]")
+        raise typer.Exit(code=1) from exc
+
+    db_path_resolved = db_path.expanduser().resolve()
+    db_path_resolved.parent.mkdir(parents=True, exist_ok=True)
+
+    pattern = _duckdb_parquet_pattern(parquet_root, symbol)
+    pattern_sql = pattern.replace("'", "''")
+
+    console.print(f"Building DuckDB at {db_path_resolved} from {pattern}")
+
+    con = duckdb.connect(str(db_path_resolved))
+    con.execute(
+        f"""
+        CREATE OR REPLACE VIEW minute AS
+        SELECT
+            *,
+            regexp_extract(filename, 'symbol=([^/]+)', 1) AS symbol,
+            regexp_extract(filename, 'year=([0-9]{{4}})', 1) AS year,
+            regexp_extract(filename, 'month=([0-9]{{2}})', 1) AS month,
+            regexp_extract(filename, 'day=([0-9]{{2}})', 1) AS day,
+            regexp_extract(filename, 'hour=([0-9]{{2}})', 1) AS hour
+        FROM read_parquet('{pattern_sql}', hive_partitioning=true, filename=true);
+        """
+    )
+    con.close()
+
+    query_file: Path | None = None
+    if write_queries:
+        query_file = db_path_resolved.with_name(f"{db_path_resolved.stem}.queries.sql")
+        query_file.write_text(_intellij_queries_sql(symbol), encoding="utf-8")
+
+    return db_path_resolved, query_file
 
 
 @app.command("init-state")
@@ -160,35 +282,56 @@ def inspect_metrics_columns(
 def materialize_duckdb(
     db_path: Path = typer.Option(Path("data/minute.duckdb"), help="Output DuckDB file"),
     symbol: str = typer.Option("BTCUSDT", help="Symbol to index"),
+    parquet_root: Path | None = typer.Option(
+        default=None,
+        help="Root data directory containing futures/um/minute (default: BML_ROOT_DIR)",
+    ),
+    write_queries: bool = typer.Option(
+        True,
+        "--write-queries/--no-write-queries",
+        help="Write a SQL starter file beside the DuckDB file for IntelliJ queries.",
+    ),
 ) -> None:
     """
     Create/update a DuckDB database with a view over all parquet partitions for IDE browsing (DataGrip/IntelliJ).
     """
-    try:
-        import duckdb  # type: ignore
-    except ImportError:
-        console.print("[red]duckdb not installed. Install with `pip install duckdb`.[/red]")
-        raise typer.Exit(code=1)
-
-    pattern = f"data/futures/um/minute/symbol={symbol.upper()}/year=*/month=*/day=*/hour=*/part.parquet"
-    console.print(f"Building DuckDB at {db_path} from {pattern}")
-
-    con = duckdb.connect(str(db_path))
-    con.execute(
-        f"""
-        CREATE OR REPLACE VIEW minute AS
-        SELECT
-            *,
-            regexp_extract(filename, 'symbol=([^/]+)', 1) AS symbol,
-            regexp_extract(filename, 'year=([0-9]{4})', 1) AS year,
-            regexp_extract(filename, 'month=([0-9]{2})', 1) AS month,
-            regexp_extract(filename, 'day=([0-9]{2})', 1) AS day,
-            regexp_extract(filename, 'hour=([0-9]{2})', 1) AS hour
-        FROM read_parquet('{pattern}', hive_partitioning=true);
-        """
+    settings = Settings()
+    root = parquet_root or settings.root_dir
+    out_db, query_file = _materialize_duckdb_view(
+        db_path=db_path,
+        parquet_root=root,
+        symbol=symbol,
+        write_queries=write_queries,
     )
-    con.close()
-    console.print("[green]DuckDB view `minute` ready.[/green]")
+    console.print(f"[green]DuckDB view `minute` ready at {out_db}.[/green]")
+    if query_file is not None:
+        console.print(f"[green]IntelliJ SQL starter created at {query_file}.[/green]")
+
+
+@app.command("prepare-intellij")
+def prepare_intellij(
+    db_path: Path = typer.Option(Path("data/minute.duckdb"), help="Output DuckDB file"),
+    symbol: str = typer.Option("BTCUSDT", help="Symbol to index"),
+    parquet_root: Path | None = typer.Option(
+        default=None,
+        help="Root data directory containing futures/um/minute (default: BML_ROOT_DIR)",
+    ),
+) -> None:
+    """
+    IntelliJ helper: materialize a DuckDB view over parquet partitions with absolute paths.
+    """
+    settings = Settings()
+    root = parquet_root or settings.root_dir
+    out_db, query_file = _materialize_duckdb_view(
+        db_path=db_path,
+        parquet_root=root,
+        symbol=symbol,
+        write_queries=True,
+    )
+    console.print("[green]IntelliJ dataset prepared.[/green]")
+    console.print(f"DuckDB file: {out_db}")
+    if query_file is not None:
+        console.print(f"Query file: {query_file}")
 
 
 @app.command("backfill-range")
@@ -274,6 +417,104 @@ def backfill_years(
 
     console.print(
         "Backfill consistency: "
+        f"hours_scanned={summary.hours_scanned}, "
+        f"issues_found={summary.issues_found}, "
+        f"issues_targeted={summary.issues_targeted}, "
+        f"hours_repaired={summary.hours_repaired}, "
+        f"hours_failed={summary.hours_failed}, "
+        f"issues_remaining={summary.issues_remaining}"
+    )
+
+    if max_missing_hours is None and summary.issues_remaining > 0:
+        raise typer.Exit(code=1)
+
+
+@app.command("backfill-loader")
+def backfill_loader(
+    year: int | None = typer.Option(
+        default=None,
+        min=1970,
+        help="Specific UTC year to validate and repair (example: 2024).",
+    ),
+    last_5_years: bool = typer.Option(
+        False,
+        "--last-5-years",
+        help="Ignore --year and repair missing data over the trailing 5 years.",
+    ),
+    sleep_seconds: float = typer.Option(
+        default=0.0,
+        min=0.0,
+        max=10.0,
+        help="Optional sleep between repaired hours to reduce API pressure",
+    ),
+    max_missing_hours: int | None = typer.Option(
+        default=None,
+        min=1,
+        help="Optional cap for number of missing/invalid hours repaired in this invocation",
+    ),
+    vision_only: bool = typer.Option(
+        True,
+        "--vision-only/--allow-rest-fallback",
+        help=(
+            "Use Binance Vision daily files only (recommended during REST bans). "
+            "Use --allow-rest-fallback to call REST when Vision files are unavailable."
+        ),
+    ),
+) -> None:
+    settings = Settings()
+    configure_logging(settings.log_level)
+
+    if year is not None and last_5_years:
+        raise typer.BadParameter("Choose either --year or --last-5-years, not both.")
+
+    selected_year = year
+    if selected_year is None and not last_5_years:
+        target_value = typer.prompt(
+            "Enter year (YYYY) to repair, or type 'all' for the last 5 years",
+            default="all",
+        )
+        selected_year = _parse_backfill_loader_target(target_value)
+    if last_5_years:
+        selected_year = None
+
+    now_utc = utc_now()
+    start_utc, end_utc = _compute_backfill_loader_window(
+        year=selected_year,
+        now_utc=now_utc,
+        safety_lag_minutes=settings.safety_lag_minutes,
+        lookback_years=5,
+    )
+    if vision_only:
+        end_utc = min(end_utc, _last_completed_utc_day_end(now_utc))
+        if end_utc < start_utc:
+            raise typer.BadParameter(
+                "No completed UTC day is available for Vision in this range yet. "
+                "Try an older year or use --allow-rest-fallback."
+            )
+
+    scope = f"year={selected_year}" if selected_year is not None else "last_5_years"
+    console.print(
+        "Backfill loader scope: "
+        f"{scope}, start={start_utc.isoformat()}, end={end_utc.isoformat()}, vision_only={vision_only}"
+    )
+
+    pipeline = MinuteIngestionPipeline(settings=settings)
+    try:
+        summary = pipeline.run_consistency_backfill(
+            start=start_utc,
+            end=end_utc,
+            now_for_band=now_utc,
+            sleep_seconds=sleep_seconds,
+            max_missing_hours=max_missing_hours,
+            force_cold_band=vision_only,
+            include_rest_enrichment=not vision_only,
+            allow_rest_fallback=not vision_only,
+        )
+    finally:
+        pipeline.close()
+
+    console.print(
+        "Backfill loader: "
         f"hours_scanned={summary.hours_scanned}, "
         f"issues_found={summary.issues_found}, "
         f"issues_targeted={summary.issues_targeted}, "

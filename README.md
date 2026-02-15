@@ -39,6 +39,9 @@ PYTHONPATH=src bml run-forever  # poll every minute indefinitely (with rate limi
 - Bounded daemon: `bml run-daemon --poll-seconds 60`
 - Backfill recent days: `PYTHONPATH=src bml backfill-range --start <ISO> --end <ISO> [--max-missing-hours N]`
 - Backfill deep history: `PYTHONPATH=src bml backfill-years --years 5 --max-missing-hours 24 --sleep-seconds 0.05`
+- Backfill loader (prompt year or all): `PYTHONPATH=src bml backfill-loader [--year 2024 | --last-5-years] [--max-missing-hours N] [--allow-rest-fallback]`
+- IntelliJ parquet access: `PYTHONPATH=src bml prepare-intellij --db-path data/minute.duckdb --symbol BTCUSDT`
+- IntelliJ runner script: `./scripts/run-intellij.sh [db_path] [symbol] [parquet_root]`
 - Inspect state: `bml show-watermark --symbol BTCUSDT`
 - Browse data in IntelliJ/DataGrip: `PYTHONPATH=src bml materialize-duckdb --db-path data/minute.duckdb` then open the DB and query the `minute` view.
 
@@ -56,6 +59,8 @@ PYTHONPATH=src bml run-forever  # poll every minute indefinitely (with rate limi
 - `PYTHONPATH=src bml run-forever` – alignment-aware infinite poller (adds rate limiting).
 - `bml show-watermark` – displays the most recent timestamp and ledger position per symbol.
 - `bml backfill-years --years 5 [--max-missing-hours N]` – consistency scan plus repair for the requested horizon.
+- `bml backfill-loader [--year YYYY | --last-5-years]` – interactive backfill helper; validates each hour folder/file and repairs missing/invalid hours only (Vision-first by default to avoid REST bans).
+- `bml prepare-intellij [--db-path data/minute.duckdb]` – creates a DuckDB view over parquet using absolute paths and writes a `.queries.sql` starter file for IntelliJ Ultimate.
 - `bml backfill-range --start <ISO> --end <ISO>` – fill gaps for arbitrary ranges; schedules heavy compute work.
 - `PYTHONPATH=src bml materialize-duckdb [--db-path data/minute.duckdb]` – build/update a DuckDB view over all parquet partitions for IDE/BI inspection.
 

@@ -235,6 +235,9 @@ class MinuteIngestionPipeline:
         now_for_band: datetime | None = None,
         sleep_seconds: float = 0.0,
         max_missing_hours: int | None = None,
+        force_cold_band: bool = False,
+        include_rest_enrichment: bool = True,
+        allow_rest_fallback: bool = True,
     ) -> ConsistencyBackfillSummary:
         scan = self.scan_partition_consistency(start=start, end=end)
         issues = list(scan.issues)
@@ -251,10 +254,16 @@ class MinuteIngestionPipeline:
         for index, issue in enumerate(target_issues):
             window_start = max(scan.start_minute, issue.hour_start)
             window_end = min(scan.end_minute, issue.hour_start + timedelta(minutes=59))
-            band = self._choose_band(now_utc=now_utc, window_end=window_end)
+            band = IngestionBand.COLD if force_cold_band else self._choose_band(now_utc=now_utc, window_end=window_end)
 
             try:
-                frame = self._collect_and_transform(window_start, window_end, band)
+                frame = self._collect_and_transform(
+                    window_start,
+                    window_end,
+                    band,
+                    include_rest_enrichment=include_rest_enrichment,
+                    allow_rest_fallback=allow_rest_fallback,
+                )
                 expected_rows = int((window_end - window_start).total_seconds() // 60) + 1
                 if frame.height != expected_rows:
                     raise DataQualityError(
@@ -305,6 +314,9 @@ class MinuteIngestionPipeline:
         window_start: datetime,
         window_end: datetime,
         band: IngestionBand,
+        *,
+        include_rest_enrichment: bool = True,
+        allow_rest_fallback: bool = True,
     ) -> pl.DataFrame:
         window_end_inclusive = window_end + timedelta(minutes=1)
 
@@ -322,19 +334,22 @@ class MinuteIngestionPipeline:
                 self._settings.symbol, window_start, window_end_inclusive
             )
             metrics_rows = self._vision_loader.load_metrics(self._settings.symbol, window_start, window_end_inclusive)
-            premium_snapshot = self._rest.fetch_premium_index(self._settings.symbol)
-            if not klines:
-                klines = self._rest.fetch_klines(self._settings.symbol, window_start, window_end_inclusive)
-            if not agg_trades:
-                agg_trades = self._fetch_agg_trades_paginated(window_start, window_end_inclusive)
-            if not mark_klines:
-                mark_klines = self._rest.fetch_mark_price_klines(
-                    self._settings.symbol, window_start, window_end_inclusive
-                )
-            if not index_klines:
-                index_klines = self._rest.fetch_index_price_klines(
-                    self._settings.symbol, window_start, window_end_inclusive
-                )
+            premium_snapshots: list[dict[str, object]] = []
+            if include_rest_enrichment:
+                premium_snapshots = [self._rest.fetch_premium_index(self._settings.symbol)]
+            if allow_rest_fallback:
+                if not klines:
+                    klines = self._rest.fetch_klines(self._settings.symbol, window_start, window_end_inclusive)
+                if not agg_trades:
+                    agg_trades = self._fetch_agg_trades_paginated(window_start, window_end_inclusive)
+                if not mark_klines:
+                    mark_klines = self._rest.fetch_mark_price_klines(
+                        self._settings.symbol, window_start, window_end_inclusive
+                    )
+                if not index_klines:
+                    index_klines = self._rest.fetch_index_price_klines(
+                        self._settings.symbol, window_start, window_end_inclusive
+                    )
         else:
             klines = self._rest.fetch_klines(self._settings.symbol, window_start, window_end_inclusive)
             mark_klines = self._rest.fetch_mark_price_klines(
@@ -349,14 +364,16 @@ class MinuteIngestionPipeline:
             ticker_snapshot["event_time"] = int(window_end_inclusive.timestamp() * 1000)
             book_ticker_snapshots = [ticker_snapshot]
             metrics_rows = []  # optional: could add openInterest snapshots here if needed
-            premium_snapshot = self._rest.fetch_premium_index(self._settings.symbol)
+            premium_snapshots = [self._rest.fetch_premium_index(self._settings.symbol)] if include_rest_enrichment else []
 
-        funding_rates = self._rest.fetch_funding_rate(
-            self._settings.symbol,
-            start_time=window_start - timedelta(hours=8),
-            end_time=window_end_inclusive,
-            limit=1000,
-        )
+        funding_rates: list[dict[str, object]] = []
+        if include_rest_enrichment:
+            funding_rates = self._rest.fetch_funding_rate(
+                self._settings.symbol,
+                start_time=window_start - timedelta(hours=8),
+                end_time=window_end_inclusive,
+                limit=1000,
+            )
         live_points = self._live_points(window_start, window_end)
 
         return self._transform.build_canonical_frame(
@@ -368,7 +385,7 @@ class MinuteIngestionPipeline:
             agg_trades=agg_trades,
             funding_rates=funding_rates,
             book_ticker_snapshots=book_ticker_snapshots,
-            premium_index_snapshots=[premium_snapshot],
+            premium_index_snapshots=premium_snapshots,
             metrics_rows=metrics_rows,
             live_features=live_points,
         )
