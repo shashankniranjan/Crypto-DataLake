@@ -18,6 +18,10 @@ class ColumnSpec:
 
 
 _CANONICAL_COLUMNS: Final[tuple[ColumnSpec, ...]] = (
+    ColumnSpec("has_ws_latency", "Bool", "coverage", SupportClass.LIVE_ONLY, "False when unavailable"),
+    ColumnSpec("has_depth", "Bool", "coverage", SupportClass.LIVE_ONLY, "False when unavailable"),
+    ColumnSpec("has_liq", "Bool", "coverage", SupportClass.LIVE_ONLY, "False when unavailable"),
+    ColumnSpec("has_ls_ratio", "Bool", "coverage", SupportClass.BACKFILL_AVAILABLE, "False when unavailable"),
     ColumnSpec("event_time", "BigInt", "websocket", SupportClass.LIVE_ONLY, "NULL if not collected"),
     ColumnSpec(
         "transact_time",
@@ -29,6 +33,7 @@ _CANONICAL_COLUMNS: Final[tuple[ColumnSpec, ...]] = (
     ColumnSpec("arrival_time", "BigInt", "local_capture", SupportClass.LIVE_ONLY, "NULL historically"),
     ColumnSpec("latency_engine", "Int", "derived", SupportClass.LIVE_ONLY, "NULL if missing inputs"),
     ColumnSpec("latency_network", "Int", "derived", SupportClass.LIVE_ONLY, "NULL if missing inputs"),
+    ColumnSpec("ws_latency_bad", "Bool", "derived", SupportClass.LIVE_ONLY, "False unless out-of-range"),
     ColumnSpec("update_id_start", "BigInt", "depth_update", SupportClass.LIVE_ONLY, "NULL if no depth"),
     ColumnSpec("update_id_end", "BigInt", "depth_update", SupportClass.LIVE_ONLY, "NULL if no depth"),
     ColumnSpec("timestamp", "Datetime", "klines", SupportClass.HARD_REQUIRED, "no nulls"),
@@ -170,6 +175,13 @@ _CANONICAL_COLUMNS: Final[tuple[ColumnSpec, ...]] = (
         "NULL unless collected",
     ),
     ColumnSpec(
+        "liq_unfilled_supported",
+        "Bool",
+        "force_order",
+        SupportClass.LIVE_ONLY,
+        "False when unfilled semantics unavailable",
+    ),
+    ColumnSpec(
         "avg_spread_usdt",
         "Float",
         "book_ticker",
@@ -211,6 +223,8 @@ _CANONICAL_COLUMNS: Final[tuple[ColumnSpec, ...]] = (
         SupportClass.LIVE_ONLY,
         "NULL unless collected",
     ),
+    ColumnSpec("impact_fillable", "Bool", "depth_book", SupportClass.LIVE_ONLY, "NULL unless collected"),
+    ColumnSpec("depth_degraded", "Bool", "depth_sync", SupportClass.LIVE_ONLY, "False unless sync degraded"),
     ColumnSpec(
         "oi_contracts",
         "Float",
@@ -323,6 +337,7 @@ _TYPE_TO_POLARS: Final[dict[str, pl.DataType]] = {
     "BigInt": pl.Int64(),
     "Int": pl.Int64(),
     "Float": pl.Float64(),
+    "Bool": pl.Boolean(),
     "Datetime": pl.Datetime("ms", time_zone="UTC"),
 }
 

@@ -238,9 +238,16 @@ class MinuteIngestionPipeline:
         force_cold_band: bool = False,
         include_rest_enrichment: bool = True,
         allow_rest_fallback: bool = True,
+        force_repair: bool = False,
     ) -> ConsistencyBackfillSummary:
         scan = self.scan_partition_consistency(start=start, end=end)
-        issues = list(scan.issues)
+        if force_repair:
+            issues = [
+                HourPartitionIssue(hour_start=hour_start, reason="force_repair")
+                for hour_start in iter_hours(scan.start_minute, scan.end_minute)
+            ]
+        else:
+            issues = list(scan.issues)
 
         if max_missing_hours is not None and max_missing_hours > 0:
             target_issues = issues[:max_missing_hours]
@@ -291,7 +298,9 @@ class MinuteIngestionPipeline:
             if sleep_seconds > 0 and index < len(target_issues) - 1:
                 time.sleep(sleep_seconds)
 
-        if max_missing_hours is None:
+        if force_repair:
+            issues_remaining = max(len(issues) - repaired, 0)
+        elif max_missing_hours is None:
             remaining_scan = self.scan_partition_consistency(start=start, end=end)
             issues_remaining = len(remaining_scan.issues)
         else:
@@ -319,6 +328,7 @@ class MinuteIngestionPipeline:
         allow_rest_fallback: bool = True,
     ) -> pl.DataFrame:
         window_end_inclusive = window_end + timedelta(minutes=1)
+        window_start_ms = int(window_start.timestamp() * 1000)
 
         if band == IngestionBand.COLD:
             self._log_vision_availability(window_start.date())
@@ -336,7 +346,38 @@ class MinuteIngestionPipeline:
             metrics_rows = self._vision_loader.load_metrics(self._settings.symbol, window_start, window_end_inclusive)
             premium_snapshots: list[dict[str, object]] = []
             if include_rest_enrichment:
-                premium_snapshots = [self._rest.fetch_premium_index(self._settings.symbol)]
+                try:
+                    premium_snapshot = self._rest.fetch_premium_index(self._settings.symbol)
+                    premium_snapshot["event_time"] = window_start_ms
+                    premium_snapshots = [premium_snapshot]
+                except Exception:
+                    logger.warning(
+                        "Optional REST enrichment unavailable",
+                        extra={"symbol": self._settings.symbol, "enrichment": "premium_index"},
+                    )
+
+                if not metrics_rows:
+                    try:
+                        oi_snapshot = self._rest.fetch_open_interest(self._settings.symbol)
+                        mark_price = (
+                            float(premium_snapshots[0]["mark_price"])
+                            if premium_snapshots and premium_snapshots[0].get("mark_price") is not None
+                            else None
+                        )
+                        oi_contracts = float(oi_snapshot["open_interest"])
+                        oi_value_usdt = oi_contracts * mark_price if mark_price is not None else None
+                        metrics_rows = [
+                            {
+                                "create_time": window_start_ms,
+                                "oi_contracts": oi_contracts,
+                                "oi_value_usdt": oi_value_usdt,
+                            }
+                        ]
+                    except Exception:
+                        logger.warning(
+                            "Optional REST enrichment unavailable",
+                            extra={"symbol": self._settings.symbol, "enrichment": "open_interest"},
+                        )
             if allow_rest_fallback:
                 if not klines:
                     klines = self._rest.fetch_klines(self._settings.symbol, window_start, window_end_inclusive)
@@ -359,21 +400,81 @@ class MinuteIngestionPipeline:
                 self._settings.symbol, window_start, window_end_inclusive
             )
             agg_trades = self._fetch_agg_trades_paginated(window_start, window_end_inclusive)
-            # Use a trailing bookTicker snapshot to backfill spread/imbalance for hot/warm minutes.
-            ticker_snapshot = self._rest.fetch_book_ticker(self._settings.symbol)
-            ticker_snapshot["event_time"] = int(window_end_inclusive.timestamp() * 1000)
-            book_ticker_snapshots = [ticker_snapshot]
-            metrics_rows = []  # optional: could add openInterest snapshots here if needed
-            premium_snapshots = [self._rest.fetch_premium_index(self._settings.symbol)] if include_rest_enrichment else []
+            # Anchor snapshots to window_start so forward-fill can populate the full hour window.
+            book_ticker_snapshots = []
+            try:
+                ticker_snapshot = self._rest.fetch_book_ticker(self._settings.symbol)
+                ticker_snapshot["event_time"] = window_start_ms
+                book_ticker_snapshots = [ticker_snapshot]
+            except Exception:
+                logger.warning(
+                    "Optional REST enrichment unavailable",
+                    extra={"symbol": self._settings.symbol, "enrichment": "book_ticker"},
+                )
+
+            metrics_rows = []
+            premium_snapshots = []
+            if include_rest_enrichment:
+                try:
+                    premium_snapshot = self._rest.fetch_premium_index(self._settings.symbol)
+                    premium_snapshot["event_time"] = window_start_ms
+                    premium_snapshots = [premium_snapshot]
+                except Exception:
+                    logger.warning(
+                        "Optional REST enrichment unavailable",
+                        extra={"symbol": self._settings.symbol, "enrichment": "premium_index"},
+                    )
+
+                try:
+                    oi_snapshot = self._rest.fetch_open_interest(self._settings.symbol)
+                    mark_price = (
+                        float(premium_snapshots[0]["mark_price"])
+                        if premium_snapshots and premium_snapshots[0].get("mark_price") is not None
+                        else None
+                    )
+                    oi_contracts = float(oi_snapshot["open_interest"])
+                    oi_value_usdt = oi_contracts * mark_price if mark_price is not None else None
+                    metrics_rows = [
+                        {
+                            "create_time": window_start_ms,
+                            "oi_contracts": oi_contracts,
+                            "oi_value_usdt": oi_value_usdt,
+                        }
+                    ]
+                except Exception:
+                    logger.warning(
+                        "Optional REST enrichment unavailable",
+                        extra={"symbol": self._settings.symbol, "enrichment": "open_interest"},
+                    )
 
         funding_rates: list[dict[str, object]] = []
         if include_rest_enrichment:
-            funding_rates = self._rest.fetch_funding_rate(
-                self._settings.symbol,
-                start_time=window_start - timedelta(hours=8),
-                end_time=window_end_inclusive,
-                limit=1000,
-            )
+            try:
+                funding_rates = self._rest.fetch_funding_rate(
+                    self._settings.symbol,
+                    start_time=window_start - timedelta(hours=8),
+                    end_time=window_end_inclusive,
+                    limit=1000,
+                )
+                funding_rates = self._seed_funding_rates_for_window(funding_rates, window_start, window_end)
+            except Exception:
+                logger.warning(
+                    "Optional REST enrichment unavailable",
+                    extra={"symbol": self._settings.symbol, "enrichment": "funding_rate"},
+                )
+        top_trader_ratio_rows: list[dict[str, object]] = []
+        global_ratio_rows: list[dict[str, object]] = []
+        if include_rest_enrichment:
+            try:
+                top_trader_ratio_rows, global_ratio_rows = self._fetch_ls_ratio_rows(
+                    window_start=window_start,
+                    window_end=window_end_inclusive,
+                )
+            except Exception:
+                logger.warning(
+                    "Optional REST enrichment unavailable",
+                    extra={"symbol": self._settings.symbol, "enrichment": "long_short_ratio"},
+                )
         live_points = self._live_points(window_start, window_end)
 
         return self._transform.build_canonical_frame(
@@ -387,8 +488,41 @@ class MinuteIngestionPipeline:
             book_ticker_snapshots=book_ticker_snapshots,
             premium_index_snapshots=premium_snapshots,
             metrics_rows=metrics_rows,
+            top_trader_ratio_rows=top_trader_ratio_rows,
+            global_ratio_rows=global_ratio_rows,
             live_features=live_points,
         )
+
+    @staticmethod
+    def _seed_funding_rates_for_window(
+        funding_rates: list[dict[str, object]],
+        window_start: datetime,
+        window_end: datetime,
+    ) -> list[dict[str, object]]:
+        if not funding_rates:
+            return funding_rates
+
+        window_start_ms = int(window_start.timestamp() * 1000)
+        window_end_ms = int(window_end.timestamp() * 1000)
+
+        has_window_row = any(
+            window_start_ms <= int(row.get("funding_time", -1)) <= window_end_ms for row in funding_rates
+        )
+        if has_window_row:
+            return funding_rates
+
+        latest_before_or_at_end: dict[str, object] | None = None
+        for row in sorted(funding_rates, key=lambda item: int(item.get("funding_time", -1))):
+            funding_time = int(row.get("funding_time", -1))
+            if funding_time <= window_end_ms:
+                latest_before_or_at_end = row
+
+        if latest_before_or_at_end is None:
+            return funding_rates
+
+        seeded = dict(latest_before_or_at_end)
+        seeded["funding_time"] = window_start_ms
+        return [seeded, *funding_rates]
 
     def _fetch_agg_trades_paginated(
         self,
@@ -423,6 +557,30 @@ class MinuteIngestionPipeline:
             time.sleep(0.05)
 
         return all_rows
+
+    def _fetch_ls_ratio_rows(
+        self,
+        *,
+        window_start: datetime,
+        window_end: datetime,
+        period: str = "5m",
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        ratio_window_start = window_start - timedelta(minutes=30)
+        top_trader = self._rest.fetch_top_trader_long_short_account_ratio(
+            symbol=self._settings.symbol,
+            period=period,
+            start_time=ratio_window_start,
+            end_time=window_end,
+            limit=500,
+        )
+        global_ratio = self._rest.fetch_global_long_short_account_ratio(
+            symbol=self._settings.symbol,
+            period=period,
+            start_time=ratio_window_start,
+            end_time=window_end,
+            limit=500,
+        )
+        return top_trader, global_ratio
 
     def _live_points(self, start: datetime, end: datetime) -> list[LiveMinuteFeatures]:
         points = []

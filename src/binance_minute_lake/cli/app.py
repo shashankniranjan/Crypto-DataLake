@@ -12,7 +12,13 @@ from binance_minute_lake.core.logging import configure_logging
 from binance_minute_lake.core.time_utils import floor_to_minute, utc_now
 from binance_minute_lake.pipeline.orchestrator import MinuteIngestionPipeline
 from binance_minute_lake.sources.metrics_inspector import MetricsZipInspector
+from binance_minute_lake.sources.rest import BinanceRESTClient
 from binance_minute_lake.sources.vision import VisionClient
+from binance_minute_lake.sources.websocket import (
+    BinanceLiveStreamSupervisor,
+    InMemoryLiveCollector,
+    LiveEventStore,
+)
 from binance_minute_lake.state.store import SQLiteStateStore
 
 app = typer.Typer(help="Binance minute lake ingestion CLI")
@@ -171,6 +177,50 @@ def show_watermark(symbol: str | None = None) -> None:
     console.print(f"Watermark[{symbol_value}] = [bold]{watermark.isoformat()}[/bold]")
 
 
+@app.command("cleanup-live-state")
+def cleanup_live_state(
+    event_db: str = typer.Option(
+        default="state/live_events.sqlite",
+        help="SQLite path for raw WS events and consumer heartbeats.",
+    ),
+    event_retention_hours: int | None = typer.Option(
+        default=None,
+        min=1,
+        help="Raw WS row retention in hours (default: BML_LIVE_EVENT_RETENTION_HOURS).",
+    ),
+    heartbeat_retention_days: int | None = typer.Option(
+        default=None,
+        min=1,
+        help="Heartbeat retention in days (default: BML_LIVE_HEARTBEAT_RETENTION_DAYS).",
+    ),
+    vacuum: bool = typer.Option(
+        default=False,
+        help="Run VACUUM after deleting old rows (slower, but reclaims file size).",
+    ),
+) -> None:
+    """
+    Prune old raw live-event rows while keeping recent replay windows.
+    """
+    settings = Settings()
+    configure_logging(settings.log_level)
+    store = LiveEventStore(Path(event_db).expanduser().resolve())
+    cleanup = store.cleanup_by_retention(
+        event_retention_hours=event_retention_hours or settings.live_event_retention_hours,
+        heartbeat_retention_days=heartbeat_retention_days or settings.live_heartbeat_retention_days,
+        vacuum=vacuum,
+    )
+    console.print(
+        "Live state cleanup complete: "
+        f"deleted={cleanup.total_deleted}, "
+        f"ws={cleanup.ws_events_deleted}, "
+        f"depth={cleanup.ws_depth_events_deleted}, "
+        f"liq={cleanup.ws_liq_events_deleted}, "
+        f"trade={cleanup.ws_trade_events_deleted}, "
+        f"heartbeats={cleanup.consumer_heartbeats_deleted}, "
+        f"vacuumed={cleanup.vacuumed}"
+    )
+
+
 @app.command("run-once")
 def run_once(
     at: str | None = typer.Option(default=None, help="Optional UTC ISO datetime"),
@@ -252,6 +302,96 @@ def run_forever(
             time.sleep(sleep_seconds)
     finally:
         pipeline.close()
+
+
+@app.command("run-live-forever")
+def run_live_forever(
+    poll_seconds: int = typer.Option(default=60, min=5, help="Aligns to minute grid; sleeps between polls"),
+    event_db: str = typer.Option(
+        default="state/live_events.sqlite",
+        help="SQLite path for raw WS events and consumer heartbeats.",
+    ),
+) -> None:
+    """
+    Live daemon that starts Binance WS consumers (depth/forceOrder/aggTrade) and persists live-only features.
+    """
+    try:
+        import websockets  # noqa: F401
+    except ImportError as exc:
+        console.print("[red]websockets not installed. Install with `pip install websockets`.[/red]")
+        raise typer.Exit(code=1) from exc
+
+    settings = Settings()
+    configure_logging(settings.log_level)
+
+    event_store = LiveEventStore(Path(event_db).expanduser().resolve())
+    live_collector = InMemoryLiveCollector(event_store=event_store, symbol=settings.symbol)
+    depth_rest = BinanceRESTClient(
+        base_url=settings.rest_base_url,
+        timeout_seconds=settings.rest_timeout_seconds,
+        retries=settings.rest_max_retries,
+    )
+    live_supervisor = BinanceLiveStreamSupervisor(
+        symbol=settings.symbol,
+        websocket_base_url=settings.websocket_base_url,
+        rest_client=depth_rest,
+        collector=live_collector,
+    )
+
+    pipeline = MinuteIngestionPipeline(settings=settings, live_collector=live_collector)
+    next_cleanup_at = utc_now()
+    next_vacuum_at = utc_now()
+    try:
+        live_supervisor.start()
+        while True:
+            try:
+                summary = pipeline.run_once()
+                console.print(
+                    "Live tick: "
+                    f"partitions={summary.partitions_committed}, "
+                    f"wm={summary.watermark_after.isoformat()}, "
+                    f"target={summary.target_horizon.isoformat()}"
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                console.print(f"[red]Live tick failed:[/red] {exc}")
+
+            now = utc_now()
+            if now >= next_cleanup_at:
+                should_vacuum = now >= next_vacuum_at
+                try:
+                    cleanup = event_store.cleanup_by_retention(
+                        now_timestamp_ms=int(now.timestamp() * 1000),
+                        event_retention_hours=settings.live_event_retention_hours,
+                        heartbeat_retention_days=settings.live_heartbeat_retention_days,
+                        vacuum=should_vacuum,
+                    )
+                    if cleanup.total_deleted > 0 or cleanup.vacuumed:
+                        console.print(
+                            "Live state cleanup: "
+                            f"deleted={cleanup.total_deleted}, "
+                            f"ws={cleanup.ws_events_deleted}, "
+                            f"depth={cleanup.ws_depth_events_deleted}, "
+                            f"liq={cleanup.ws_liq_events_deleted}, "
+                            f"trade={cleanup.ws_trade_events_deleted}, "
+                            f"heartbeats={cleanup.consumer_heartbeats_deleted}, "
+                            f"vacuumed={cleanup.vacuumed}"
+                        )
+                except Exception as exc:  # pylint: disable=broad-except
+                    console.print(f"[yellow]Live state cleanup skipped:[/yellow] {exc}")
+
+                next_cleanup_at = now + timedelta(minutes=settings.live_cleanup_interval_minutes)
+                if should_vacuum:
+                    next_vacuum_at = now + timedelta(hours=settings.live_cleanup_vacuum_interval_hours)
+
+            remainder = now.timestamp() % poll_seconds
+            sleep_seconds = poll_seconds - remainder
+            if sleep_seconds < 0.05:
+                sleep_seconds = poll_seconds
+            time.sleep(sleep_seconds)
+    finally:
+        live_supervisor.stop()
+        pipeline.close()
+        depth_rest.close()
 
 
 @app.command("inspect-metrics-columns")
@@ -352,6 +492,11 @@ def backfill_range(
         min=1,
         help="Optional cap for number of missing/invalid hours repaired in this invocation",
     ),
+    force_repair: bool = typer.Option(
+        False,
+        "--force-repair",
+        help="Rebuild all hours in the range, not just missing/invalid partitions.",
+    ),
 ) -> None:
     settings = Settings()
     configure_logging(settings.log_level)
@@ -373,6 +518,7 @@ def backfill_range(
             now_for_band=utc_now(),
             sleep_seconds=sleep_seconds,
             max_missing_hours=max_missing_hours,
+            force_repair=force_repair,
         )
     finally:
         pipeline.close()
@@ -460,6 +606,11 @@ def backfill_loader(
             "Use --allow-rest-fallback to call REST when Vision files are unavailable."
         ),
     ),
+    force_repair: bool = typer.Option(
+        False,
+        "--force-repair",
+        help="Rebuild all hours in the selected scope, not just missing/invalid partitions.",
+    ),
 ) -> None:
     settings = Settings()
     configure_logging(settings.log_level)
@@ -509,6 +660,7 @@ def backfill_loader(
             force_cold_band=vision_only,
             include_rest_enrichment=not vision_only,
             allow_rest_fallback=not vision_only,
+            force_repair=force_repair,
         )
     finally:
         pipeline.close()

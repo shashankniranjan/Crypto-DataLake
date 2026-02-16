@@ -1,4 +1,4 @@
-.PHONY: install-dev lint format typecheck test run-once
+.PHONY: install-dev lint format typecheck test run-once run-live
 
 install-dev:
 	python -m pip install -e .[dev]
@@ -17,3 +17,6 @@ test:
 
 run-once:
 	bml run-once
+
+run-live:
+	./scripts/run-live.sh

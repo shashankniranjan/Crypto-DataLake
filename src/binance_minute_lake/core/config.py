@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     rest_timeout_seconds: int = Field(default=20, ge=1)
     rest_max_retries: int = Field(default=5, ge=1)
     rest_concurrency: int = Field(default=4, ge=1)
+    live_event_retention_hours: int = Field(default=72, ge=1)
+    live_heartbeat_retention_days: int = Field(default=14, ge=1)
+    live_cleanup_interval_minutes: int = Field(default=30, ge=1)
+    live_cleanup_vacuum_interval_hours: int = Field(default=24, ge=1)
 
     log_level: str = Field(default="INFO")
 

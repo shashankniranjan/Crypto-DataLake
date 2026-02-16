@@ -82,3 +82,55 @@ def test_atomic_write_merges_existing_partition_without_losing_rows(tmp_path: Pa
     )
     assert row_open_10_00 == 200.0
     assert row_open_10_01 == 101.0
+
+
+def test_atomic_write_preserves_live_columns_when_rewritten_without_live_data(tmp_path: Path) -> None:
+    state_store = SQLiteStateStore(tmp_path / "state.sqlite")
+    state_store.initialize()
+    writer = AtomicParquetWriter(tmp_path, state_store, DQValidator())
+    hour_start = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
+    minute_ts = datetime(2026, 1, 15, 10, 3, tzinfo=UTC)
+
+    live_row = _canonical_row(minute_ts, 100.0)
+    live_row.update(
+        {
+            "has_ws_latency": True,
+            "has_depth": True,
+            "event_time": int(minute_ts.timestamp() * 1000) + 10,
+            "arrival_time": int(minute_ts.timestamp() * 1000) + 30,
+            "latency_engine": 20,
+            "latency_network": 21,
+            "update_id_start": 100,
+            "update_id_end": 110,
+            "price_impact_100k": 0.0002,
+            "impact_fillable": True,
+        }
+    )
+    writer.write_hour_partition(
+        symbol="BTCUSDT",
+        hour_start=hour_start,
+        frame=pl.DataFrame([live_row]),
+    )
+
+    rewritten_row = _canonical_row(minute_ts, 101.0)
+    rewritten_row.update(
+        {
+            "has_ws_latency": False,
+            "has_depth": False,
+            "has_liq": False,
+        }
+    )
+    output = writer.write_hour_partition(
+        symbol="BTCUSDT",
+        hour_start=hour_start,
+        frame=pl.DataFrame([rewritten_row]),
+    )
+
+    merged = pl.read_parquet(output)
+    row = merged.row(0, named=True)
+    assert row["open"] == 101.0
+    assert row["has_ws_latency"] is True
+    assert row["has_depth"] is True
+    assert row["event_time"] == int(minute_ts.timestamp() * 1000) + 10
+    assert row["update_id_start"] == 100
+    assert row["price_impact_100k"] == 0.0002

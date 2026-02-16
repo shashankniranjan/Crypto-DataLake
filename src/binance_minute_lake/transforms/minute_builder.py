@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import asdict
+from datetime import UTC, datetime, timedelta
 
 import polars as pl
 
@@ -25,6 +26,8 @@ class MinuteTransformEngine:
         book_ticker_snapshots: list[dict[str, object]] | None = None,
         premium_index_snapshots: list[dict[str, object]] | None = None,
         metrics_rows: list[dict[str, object]] | None = None,
+        top_trader_ratio_rows: list[dict[str, object]] | None = None,
+        global_ratio_rows: list[dict[str, object]] | None = None,
         live_features: list[LiveMinuteFeatures] | None = None,
     ) -> pl.DataFrame:
         frame = self._minute_spine(start_minute, end_minute)
@@ -45,6 +48,16 @@ class MinuteTransformEngine:
             how="left",
         )
         frame = frame.join(self._metrics_frame(metrics_rows or []), on="timestamp", how="left")
+        frame = frame.join(
+            self._ls_ratio_frame(
+                start_minute=start_minute,
+                end_minute=end_minute,
+                top_trader_records=top_trader_ratio_rows or [],
+                global_records=global_ratio_rows or [],
+            ),
+            on="timestamp",
+            how="left",
+        )
         frame = frame.join(self._live_frame(live_features or []), on="timestamp", how="left")
 
         frame = self._derive_columns(frame)
@@ -259,66 +272,160 @@ class MinuteTransformEngine:
         if not records:
             return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
 
-        frame = (
-            pl.DataFrame(records)
-            .with_columns(self._to_minute_timestamp("create_time"))
-            .with_columns(
-                pl.when(pl.col("count_toptrader_long_short_ratio") > 0)
-                .then(pl.col("sum_open_interest") / pl.col("count_toptrader_long_short_ratio"))
-                .otherwise(None)
-                .alias("oi_contracts"),
-                pl.when(pl.col("count_toptrader_long_short_ratio") > 0)
-                .then(pl.col("sum_open_interest_value") / pl.col("count_toptrader_long_short_ratio"))
-                .otherwise(None)
-                .alias("oi_value_usdt"),
-                pl.when(pl.col("count_toptrader_long_short_ratio") > 0)
-                .then(pl.col("sum_toptrader_long_short_ratio") / pl.col("count_toptrader_long_short_ratio"))
-                .otherwise(None)
-                .alias("top_trader_ls_ratio_acct"),
-                pl.when(pl.col("count_long_short_ratio") > 0)
-                .then(pl.col("sum_taker_long_short_vol_ratio") / pl.col("count_long_short_ratio"))
-                .otherwise(None)
-                .alias("global_ls_ratio_acct"),
+        frame = pl.DataFrame(records)
+
+        if "create_time" not in frame.columns:
+            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+
+        create_time_expr = pl.col("create_time")
+        if frame.schema["create_time"] == pl.Utf8:
+            create_time_expr = (
+                pl.col("create_time")
+                .str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S", strict=False)
+                .dt.replace_time_zone("UTC")
+                .dt.timestamp("ms")
             )
-            .with_columns(
-                (pl.col("top_trader_ls_ratio_acct") - pl.col("global_ls_ratio_acct")).alias("ls_ratio_divergence")
+
+        frame = frame.with_columns(create_time_expr.cast(pl.Int64, strict=False).alias("create_time"))
+        frame = frame.with_columns(self._to_minute_timestamp("create_time"))
+
+        has_direct_metrics = "oi_contracts" in frame.columns or "oi_value_usdt" in frame.columns
+        if has_direct_metrics:
+            direct_columns = ["oi_contracts", "oi_value_usdt"]
+            for column in direct_columns:
+                if column not in frame.columns:
+                    frame = frame.with_columns(pl.lit(None).cast(pl.Float64).alias(column))
+        else:
+            frame = (
+                frame.with_columns(
+                    pl.when(pl.col("count_toptrader_long_short_ratio") > 0)
+                    .then(pl.col("sum_open_interest") / pl.col("count_toptrader_long_short_ratio"))
+                    .otherwise(None)
+                    .alias("oi_contracts"),
+                    pl.when(pl.col("count_toptrader_long_short_ratio") > 0)
+                    .then(pl.col("sum_open_interest_value") / pl.col("count_toptrader_long_short_ratio"))
+                    .otherwise(None)
+                    .alias("oi_value_usdt"),
+                )
             )
-            .with_columns(
-                pl.lit(None).cast(pl.Float64).alias("top_trader_long_pct"),
-                pl.lit(None).cast(pl.Float64).alias("top_trader_short_pct"),
-            )
-        )
 
         return (
             frame.select(
                 "timestamp",
                 "oi_contracts",
                 "oi_value_usdt",
-                "top_trader_ls_ratio_acct",
-                "global_ls_ratio_acct",
-                "ls_ratio_divergence",
-                "top_trader_long_pct",
-                "top_trader_short_pct",
             )
             .unique(subset=["timestamp"], keep="last")
+        )
+
+    @staticmethod
+    def _ratio_point_frame(
+        records: list[dict[str, object]],
+        *,
+        ratio_column: str,
+    ) -> pl.DataFrame:
+        if not records:
+            return pl.DataFrame({"data_timestamp": []}, schema={"data_timestamp": pl.Datetime("ms", "UTC")})
+
+        frame = pl.DataFrame(records)
+        if "data_time" not in frame.columns:
+            return pl.DataFrame({"data_timestamp": []}, schema={"data_timestamp": pl.Datetime("ms", "UTC")})
+
+        expressions: list[pl.Expr] = [
+            pl.from_epoch(pl.col("data_time").cast(pl.Int64), time_unit="ms")
+            .dt.replace_time_zone("UTC")
+            .alias("data_timestamp"),
+            pl.col("ratio").cast(pl.Float64).alias(ratio_column),
+        ]
+        if "long_account" in frame.columns:
+            expressions.append(pl.col("long_account").cast(pl.Float64).alias("top_trader_long_pct"))
+        if "short_account" in frame.columns:
+            expressions.append(pl.col("short_account").cast(pl.Float64).alias("top_trader_short_pct"))
+        ratio_frame = pl.DataFrame(records).with_columns(*expressions)
+        if "top_trader_long_pct" not in ratio_frame.columns:
+            ratio_frame = ratio_frame.with_columns(pl.lit(None).cast(pl.Float64).alias("top_trader_long_pct"))
+        if "top_trader_short_pct" not in ratio_frame.columns:
+            ratio_frame = ratio_frame.with_columns(pl.lit(None).cast(pl.Float64).alias("top_trader_short_pct"))
+        return ratio_frame.sort("data_timestamp")
+
+    def _ls_ratio_frame(
+        self,
+        *,
+        start_minute: datetime,
+        end_minute: datetime,
+        top_trader_records: list[dict[str, object]],
+        global_records: list[dict[str, object]],
+    ) -> pl.DataFrame:
+        spine = self._minute_spine(start_minute, end_minute).sort("timestamp")
+        top = self._ratio_point_frame(top_trader_records, ratio_column="top_trader_ls_ratio_acct")
+        if top.height > 0:
+            spine = spine.join_asof(
+                top.select("data_timestamp", "top_trader_ls_ratio_acct", "top_trader_long_pct", "top_trader_short_pct"),
+                left_on="timestamp",
+                right_on="data_timestamp",
+                strategy="backward",
+                tolerance=timedelta(minutes=30),
+            ).drop("data_timestamp")
+        else:
+            spine = spine.with_columns(
+                pl.lit(None).cast(pl.Float64).alias("top_trader_ls_ratio_acct"),
+                pl.lit(None).cast(pl.Float64).alias("top_trader_long_pct"),
+                pl.lit(None).cast(pl.Float64).alias("top_trader_short_pct"),
+            )
+
+        global_frame = self._ratio_point_frame(global_records, ratio_column="global_ls_ratio_acct")
+        if global_frame.height > 0:
+            spine = spine.join_asof(
+                global_frame.select("data_timestamp", "global_ls_ratio_acct"),
+                left_on="timestamp",
+                right_on="data_timestamp",
+                strategy="backward",
+                tolerance=timedelta(minutes=30),
+            ).drop("data_timestamp")
+        else:
+            spine = spine.with_columns(pl.lit(None).cast(pl.Float64).alias("global_ls_ratio_acct"))
+
+        return spine.with_columns(
+            pl.when(pl.col("top_trader_ls_ratio_acct").is_not_null() & pl.col("global_ls_ratio_acct").is_not_null())
+            .then(pl.col("top_trader_ls_ratio_acct") - pl.col("global_ls_ratio_acct"))
+            .otherwise(None)
+            .alias("ls_ratio_divergence"),
+            (pl.col("top_trader_ls_ratio_acct").is_not_null() & pl.col("global_ls_ratio_acct").is_not_null()).alias(
+                "has_ls_ratio"
+            ),
         )
 
     def _live_frame(self, records: list[LiveMinuteFeatures]) -> pl.DataFrame:
         if not records:
             return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
-        frame = pl.DataFrame([item.__dict__ for item in records]).with_columns(
+        frame = pl.DataFrame([asdict(item) for item in records]).with_columns(
             self._to_minute_timestamp("timestamp_ms")
         )
         return (
             frame.group_by("timestamp")
             .agg(
+                pl.col("has_ws_latency").last().alias("has_ws_latency"),
+                pl.col("has_depth").last().alias("has_depth"),
+                pl.col("has_liq").last().alias("has_liq"),
+                pl.col("has_ls_ratio").last().alias("has_ls_ratio"),
                 pl.col("event_time").last().alias("event_time"),
+                pl.col("transact_time").last().alias("transact_time"),
                 pl.col("arrival_time").last().alias("arrival_time"),
                 pl.col("latency_engine").last().alias("latency_engine"),
                 pl.col("latency_network").last().alias("latency_network"),
+                pl.col("ws_latency_bad").last().alias("ws_latency_bad"),
                 pl.col("update_id_start").last().alias("update_id_start"),
                 pl.col("update_id_end").last().alias("update_id_end"),
                 pl.col("price_impact_100k").last().alias("price_impact_100k"),
+                pl.col("impact_fillable").last().alias("impact_fillable"),
+                pl.col("depth_degraded").last().alias("depth_degraded"),
+                pl.col("liq_long_vol_usdt").last().alias("liq_long_vol_usdt"),
+                pl.col("liq_short_vol_usdt").last().alias("liq_short_vol_usdt"),
+                pl.col("liq_long_count").last().alias("liq_long_count"),
+                pl.col("liq_short_count").last().alias("liq_short_count"),
+                pl.col("liq_avg_fill_price").last().alias("liq_avg_fill_price"),
+                pl.col("liq_unfilled_ratio").last().alias("liq_unfilled_ratio"),
+                pl.col("liq_unfilled_supported").last().alias("liq_unfilled_supported"),
                 pl.col("predicted_funding").last().alias("predicted_funding"),
                 pl.col("next_funding_time").last().alias("next_funding_time"),
             )
@@ -327,7 +434,18 @@ class MinuteTransformEngine:
 
     @staticmethod
     def _derive_columns(frame: pl.DataFrame) -> pl.DataFrame:
-        default_columns: dict[str, float | int | None] = {
+        for column in ("predicted_funding", "next_funding_time", "has_ls_ratio", "transact_time"):
+            right_column = f"{column}_right"
+            if right_column in frame.columns:
+                frame = frame.with_columns(pl.coalesce([pl.col(right_column), pl.col(column)]).alias(column)).drop(
+                    right_column
+                )
+
+        default_columns: dict[str, float | int | bool | None] = {
+            "has_ws_latency": False,
+            "has_depth": False,
+            "has_liq": False,
+            "has_ls_ratio": False,
             "trade_count": 0,
             "volume_btc": 0.0,
             "close": None,
@@ -348,12 +466,27 @@ class MinuteTransformEngine:
             "index_price_close": None,
             "funding_rate": None,
             "premium_last_funding_rate": None,
+            "ws_latency_bad": None,
+            "impact_fillable": None,
+            "depth_degraded": None,
+            "liq_long_vol_usdt": None,
+            "liq_short_vol_usdt": None,
+            "liq_long_count": None,
+            "liq_short_count": None,
+            "liq_avg_fill_price": None,
+            "liq_unfilled_ratio": None,
+            "liq_unfilled_supported": None,
+            "top_trader_ls_ratio_acct": None,
+            "global_ls_ratio_acct": None,
+            "ls_ratio_divergence": None,
+            "top_trader_long_pct": None,
+            "top_trader_short_pct": None,
         }
         for column, default in default_columns.items():
             if column not in frame.columns:
                 frame = frame.with_columns(pl.lit(default).alias(column))
 
-        return frame.with_columns(
+        frame = frame.with_columns(
             pl.when(pl.col("trade_count").fill_null(0) > 0)
             .then(pl.col("volume_btc") / pl.col("trade_count"))
             .otherwise(0.0)
@@ -378,10 +511,63 @@ class MinuteTransformEngine:
             pl.coalesce([pl.col("vol_sell_retail_btc"), pl.lit(0.0)]).alias("vol_sell_retail_btc"),
             pl.coalesce([pl.col("whale_trade_count"), pl.lit(0)]).alias("whale_trade_count"),
             pl.coalesce([pl.col("realized_vol_1m"), pl.lit(0.0)]).alias("realized_vol_1m"),
+            pl.when(pl.col("top_trader_ls_ratio_acct").is_not_null() & pl.col("global_ls_ratio_acct").is_not_null())
+            .then(True)
+            .otherwise(pl.col("has_ls_ratio").fill_null(False))
+            .alias("has_ls_ratio"),
+            pl.col("has_ws_latency").fill_null(False).alias("has_ws_latency"),
+            pl.col("has_depth").fill_null(False).alias("has_depth"),
+            pl.col("has_liq").fill_null(False).alias("has_liq"),
+            pl.when(pl.col("has_ws_latency").fill_null(False))
+            .then(pl.coalesce([pl.col("ws_latency_bad"), pl.lit(False)]))
+            .otherwise(None)
+            .alias("ws_latency_bad"),
+            pl.when(pl.col("has_depth").fill_null(False))
+            .then(pl.coalesce([pl.col("depth_degraded"), pl.lit(False)]))
+            .otherwise(None)
+            .alias("depth_degraded"),
+            pl.when(pl.col("has_liq").fill_null(False))
+            .then(pl.coalesce([pl.col("liq_unfilled_supported"), pl.lit(False)]))
+            .otherwise(None)
+            .alias("liq_unfilled_supported"),
+            pl.when(pl.col("has_liq").fill_null(False))
+            .then(pl.coalesce([pl.col("liq_long_vol_usdt"), pl.lit(0.0)]))
+            .otherwise(None)
+            .alias("liq_long_vol_usdt"),
+            pl.when(pl.col("has_liq").fill_null(False))
+            .then(pl.coalesce([pl.col("liq_short_vol_usdt"), pl.lit(0.0)]))
+            .otherwise(None)
+            .alias("liq_short_vol_usdt"),
+            pl.when(pl.col("has_liq").fill_null(False))
+            .then(pl.coalesce([pl.col("liq_long_count"), pl.lit(0)]))
+            .otherwise(None)
+            .alias("liq_long_count"),
+            pl.when(pl.col("has_liq").fill_null(False))
+            .then(pl.coalesce([pl.col("liq_short_count"), pl.lit(0)]))
+            .otherwise(None)
+            .alias("liq_short_count"),
+            pl.when(pl.col("has_liq").fill_null(False))
+            .then(pl.col("liq_avg_fill_price"))
+            .otherwise(None)
+            .alias("liq_avg_fill_price"),
+            pl.when(pl.col("has_liq").fill_null(False))
+            .then(
+                pl.when(pl.col("liq_unfilled_supported") == True)
+                .then(pl.col("liq_unfilled_ratio"))
+                .otherwise(None)
+            )
+            .otherwise(None)
+            .alias("liq_unfilled_ratio"),
+            pl.when(pl.col("top_trader_ls_ratio_acct").is_not_null() & pl.col("global_ls_ratio_acct").is_not_null())
+            .then(pl.col("top_trader_ls_ratio_acct") - pl.col("global_ls_ratio_acct"))
+            .otherwise(None)
+            .alias("ls_ratio_divergence"),
         )
+        return frame
 
     def _apply_fill_policies(self, frame: pl.DataFrame) -> pl.DataFrame:
         ffill_columns = [
+            "micro_price_close",
             "avg_spread_usdt",
             "bid_ask_imbalance",
             "avg_bid_depth",
@@ -389,11 +575,6 @@ class MinuteTransformEngine:
             "spread_pct",
             "oi_contracts",
             "oi_value_usdt",
-            "top_trader_ls_ratio_acct",
-            "global_ls_ratio_acct",
-            "ls_ratio_divergence",
-            "top_trader_long_pct",
-            "top_trader_short_pct",
             "funding_rate",
         ]
         expressions: list[pl.Expr] = []

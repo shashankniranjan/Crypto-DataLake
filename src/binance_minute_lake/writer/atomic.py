@@ -7,10 +7,15 @@ from pathlib import Path
 
 import polars as pl
 
-from binance_minute_lake.core.enums import PartitionStatus
-from binance_minute_lake.core.schema import canonical_column_names, schema_hash_input
+from binance_minute_lake.core.enums import PartitionStatus, SupportClass
+from binance_minute_lake.core.schema import canonical_column_names, canonical_columns, schema_hash_input
 from binance_minute_lake.state.store import PartitionLedgerEntry, SQLiteStateStore
 from binance_minute_lake.validation.dq import DQValidator
+
+_LIVE_ONLY_COLUMNS = tuple(
+    column.name for column in canonical_columns() if column.support_class == SupportClass.LIVE_ONLY
+)
+_LIVE_COVERAGE_COLUMNS = frozenset({"has_ws_latency", "has_depth", "has_liq"})
 
 
 class AtomicParquetWriter:
@@ -59,13 +64,36 @@ class AtomicParquetWriter:
 
     @staticmethod
     def _merge_partition_frames(existing_frame: pl.DataFrame, new_frame: pl.DataFrame) -> pl.DataFrame:
-        merged = pl.concat([existing_frame, new_frame], how="vertical")
+        merged = pl.concat([existing_frame, new_frame], how="vertical_relaxed")
         merged = (
             merged.sort("timestamp")
             .unique(subset=["timestamp"], keep="last")
             .sort("timestamp")
-            .select(canonical_column_names())
         )
+
+        existing_live = existing_frame.select(["timestamp", *_LIVE_ONLY_COLUMNS])
+        merged = merged.join(existing_live, on="timestamp", how="left", suffix="_existing")
+
+        preserve_exprs: list[pl.Expr] = []
+        existing_columns_to_drop: list[str] = []
+        for column in _LIVE_ONLY_COLUMNS:
+            existing_column = f"{column}_existing"
+            if existing_column not in merged.columns:
+                continue
+            existing_columns_to_drop.append(existing_column)
+            if column in _LIVE_COVERAGE_COLUMNS:
+                preserve_exprs.append(
+                    (pl.col(column).fill_null(False) | pl.col(existing_column).fill_null(False)).alias(column)
+                )
+            else:
+                preserve_exprs.append(pl.coalesce([pl.col(column), pl.col(existing_column)]).alias(column))
+
+        if preserve_exprs:
+            merged = merged.with_columns(*preserve_exprs)
+        if existing_columns_to_drop:
+            merged = merged.drop(existing_columns_to_drop)
+
+        merged = merged.select(canonical_column_names())
         return merged
 
     def _partition_path(self, symbol: str, hour_start: datetime) -> Path:

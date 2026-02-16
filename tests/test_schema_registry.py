@@ -2,10 +2,10 @@ from binance_minute_lake.core.enums import SupportClass
 from binance_minute_lake.core.schema import canonical_columns, hard_required_columns
 
 
-def test_schema_has_58_columns() -> None:
+def test_schema_has_66_columns() -> None:
     columns = canonical_columns()
-    assert len(columns) == 58
-    assert len({column.name for column in columns}) == 58
+    assert len(columns) == 66
+    assert len({column.name for column in columns}) == 66
 
 
 def test_schema_contains_required_support_classes() -> None:

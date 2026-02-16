@@ -1,6 +1,6 @@
 # Crypto-Data-Scheduler
 
-**Crypto-Data-Scheduler** is the production-grade monorepo that powers the Binance Minute Lake ingestion system. It maintains the 58-column canonical 1‑minute USD-M futures view via hybrid ingestion (WebSocket, REST, Vision) and enforces the schema, lineage, and consistency requirements described in the Requirements Addendum.
+**Crypto-Data-Scheduler** is the production-grade monorepo that powers the Binance Minute Lake ingestion system. It maintains the 66-column canonical 1‑minute USD-M futures view via hybrid ingestion (WebSocket, REST, Vision) and enforces the schema, lineage, and consistency requirements described in the Requirements Addendum.
 
 ## Why this repo exists
 
@@ -36,12 +36,15 @@ PYTHONPATH=src bml run-forever  # poll every minute indefinitely (with rate limi
 
 - One-off minute: `PYTHONPATH=src bml run-once`
 - Continuous polling: `PYTHONPATH=src bml run-forever` (minute-aligned, throttled)
+- Live WS + polling: `PYTHONPATH=src bml run-live-forever --event-db state/live_events.sqlite`
+- Single-command live runner: `./scripts/run-live.sh` (or `make run-live`) (runs one-time cleanup, then starts live daemon)
+- Manual live state cleanup: `PYTHONPATH=src bml cleanup-live-state --event-db state/live_events.sqlite --vacuum`
 - Bounded daemon: `bml run-daemon --poll-seconds 60`
-- Backfill recent days: `PYTHONPATH=src bml backfill-range --start <ISO> --end <ISO> [--max-missing-hours N]`
+- Backfill recent days: `PYTHONPATH=src bml backfill-range --start <ISO> --end <ISO> [--max-missing-hours N] [--force-repair]`
 - Backfill deep history: `PYTHONPATH=src bml backfill-years --years 5 --max-missing-hours 24 --sleep-seconds 0.05`
-- Backfill loader (prompt year or all): `PYTHONPATH=src bml backfill-loader [--year 2024 | --last-5-years] [--max-missing-hours N] [--allow-rest-fallback]`
+- Backfill loader (prompt year or all): `PYTHONPATH=src bml backfill-loader [--year 2024 | --last-5-years] [--max-missing-hours N] [--allow-rest-fallback] [--force-repair]`
 - IntelliJ parquet access: `PYTHONPATH=src bml prepare-intellij --db-path data/minute.duckdb --symbol BTCUSDT`
-- IntelliJ runner script: `./scripts/run-intellij.sh [db_path] [symbol] [parquet_root]`
+- IntelliJ + daemon runner script: `./scripts/run-intellij.sh [db_path] [symbol] [parquet_root] [poll_seconds]`
 - Inspect state: `bml show-watermark --symbol BTCUSDT`
 - Browse data in IntelliJ/DataGrip: `PYTHONPATH=src bml materialize-duckdb --db-path data/minute.duckdb` then open the DB and query the `minute` view.
 
@@ -51,17 +54,24 @@ PYTHONPATH=src bml run-forever  # poll every minute indefinitely (with rate limi
 2. Copy `.env.example` to `.env` and audit values for credentials and S3 paths.
 3. Use `poetry shell` or `source .venv/bin/activate` before running `bml` commands.
 4. Validate `state/` and `logs/` directories are writable by the service account that will run the CLI.
+5. Optional retention tuning:
+   - `BML_LIVE_EVENT_RETENTION_HOURS` (default `72`)
+   - `BML_LIVE_HEARTBEAT_RETENTION_DAYS` (default `14`)
+   - `BML_LIVE_CLEANUP_INTERVAL_MINUTES` (default `30`)
+   - `BML_LIVE_CLEANUP_VACUUM_INTERVAL_HOURS` (default `24`)
 
 ## CLI reference
 
 - `bml run-once` – executes a single minute job, writing parquet and booking ledger entries.
 - `bml run-daemon --poll-seconds 60` – loops the minute job with configurable polling; use a process manager (systemd, supervisord) in prod.
 - `PYTHONPATH=src bml run-forever` – alignment-aware infinite poller (adds rate limiting).
+- `PYTHONPATH=src bml run-live-forever` – live daemon; includes automatic retention cleanup for `state/live_events.sqlite`.
+- `PYTHONPATH=src bml cleanup-live-state` – one-off retention cleanup and optional SQLite `VACUUM`.
 - `bml show-watermark` – displays the most recent timestamp and ledger position per symbol.
 - `bml backfill-years --years 5 [--max-missing-hours N]` – consistency scan plus repair for the requested horizon.
 - `bml backfill-loader [--year YYYY | --last-5-years]` – interactive backfill helper; validates each hour folder/file and repairs missing/invalid hours only (Vision-first by default to avoid REST bans).
 - `bml prepare-intellij [--db-path data/minute.duckdb]` – creates a DuckDB view over parquet using absolute paths and writes a `.queries.sql` starter file for IntelliJ Ultimate.
-- `bml backfill-range --start <ISO> --end <ISO>` – fill gaps for arbitrary ranges; schedules heavy compute work.
+- `bml backfill-range --start <ISO> --end <ISO>` – fill gaps for arbitrary ranges; add `--force-repair` to rebuild all hours in range.
 - `PYTHONPATH=src bml materialize-duckdb [--db-path data/minute.duckdb]` – build/update a DuckDB view over all parquet partitions for IDE/BI inspection.
 
 Each backfill path scans existing partitions for gaps and invokes repairs for any missing hours (bounded by `--max-missing-hours` when provided).

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import logging
-import time
-from datetime import UTC, datetime
 import random
 import time
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -119,7 +118,7 @@ class BinanceRESTClient:
                 self._min_retry_delay_seconds * (2 ** max(attempt - 1, 0)),
             )
         # add small jitter to desynchronize from exchange rate limits
-        delay += random.uniform(0.0, 0.3)
+        delay += random.uniform(0.0, 0.3)  # noqa: S311
 
         logger.warning(
             "Retrying Binance REST request",
@@ -303,6 +302,85 @@ class BinanceRESTClient:
             "open_interest": float(payload["openInterest"]),
             "event_time": int(payload.get("time", 0)),
         }
+
+    def fetch_depth_snapshot(self, symbol: str, limit: int = 1000) -> dict[str, Any]:
+        payload = self._get(
+            "/fapi/v1/depth",
+            {
+                "symbol": symbol.upper(),
+                "limit": limit,
+            },
+        )
+        return {
+            "symbol": symbol.upper(),
+            "last_update_id": int(payload["lastUpdateId"]),
+            "bids": [(float(price), float(quantity)) for price, quantity in payload.get("bids", [])],
+            "asks": [(float(price), float(quantity)) for price, quantity in payload.get("asks", [])],
+            "event_time": int(payload.get("E", 0) or 0),
+            "transact_time": int(payload.get("T", 0) or 0),
+        }
+
+    def fetch_top_trader_long_short_account_ratio(
+        self,
+        symbol: str,
+        *,
+        period: str = "5m",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": limit,
+        }
+        if start_time is not None:
+            params["startTime"] = self._to_ms(start_time)
+        if end_time is not None:
+            params["endTime"] = self._to_ms(end_time)
+
+        payload = self._get("/futures/data/topLongShortAccountRatio", params)
+        return [
+            {
+                "symbol": item["symbol"],
+                "data_time": int(item["timestamp"]),
+                "ratio": float(item["longShortRatio"]),
+                "long_account": float(item["longAccount"]),
+                "short_account": float(item["shortAccount"]),
+            }
+            for item in payload
+        ]
+
+    def fetch_global_long_short_account_ratio(
+        self,
+        symbol: str,
+        *,
+        period: str = "5m",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": limit,
+        }
+        if start_time is not None:
+            params["startTime"] = self._to_ms(start_time)
+        if end_time is not None:
+            params["endTime"] = self._to_ms(end_time)
+
+        payload = self._get("/futures/data/globalLongShortAccountRatio", params)
+        return [
+            {
+                "symbol": item["symbol"],
+                "data_time": int(item["timestamp"]),
+                "ratio": float(item["longShortRatio"]),
+                "long_account": float(item["longAccount"]),
+                "short_account": float(item["shortAccount"]),
+            }
+            for item in payload
+        ]
 
     def fetch_funding_rate(
         self,

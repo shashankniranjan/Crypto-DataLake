@@ -7,7 +7,7 @@ Build a production-grade, local-first ingestion system for Binance UM futures mi
 ## Phase 1: Foundation
 
 1. Packaging and quality tooling (`pyproject`, lint, typecheck, tests).
-2. Canonical schema registry (58 columns, support class, fill policy).
+2. Canonical schema registry (66 columns, support class, fill policy).
 3. Config and logging bootstrap.
 
 ## Phase 2: Data Plane
