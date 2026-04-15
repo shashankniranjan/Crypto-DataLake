@@ -127,6 +127,17 @@ def test_live_event_store_writes_raw_tables_and_heartbeats(tmp_path: Path) -> No
         ask_deltas=[(100.5, 13.0)],
         previous_final_update_id=100,
         arrival_time=minute + 2_030,
+        raw_payload={
+            "e": "depthUpdate",
+            "E": minute + 2_000,
+            "T": minute + 1_980,
+            "s": "BTCUSDT",
+            "U": 101,
+            "u": 102,
+            "pu": 100,
+            "b": [["99.5", "12.0"]],
+            "a": [["100.5", "13.0"]],
+        },
     )
     collector.ingest_liquidation_event(
         LiquidationOrderEvent(
@@ -146,11 +157,16 @@ def test_live_event_store_writes_raw_tables_and_heartbeats(tmp_path: Path) -> No
         liq_rows = connection.execute("SELECT COUNT(*) FROM ws_liq_events").fetchone()[0]
         trade_rows = connection.execute("SELECT COUNT(*) FROM ws_trade_events").fetchone()[0]
         heartbeat_rows = connection.execute("SELECT COUNT(*) FROM consumer_heartbeats").fetchone()[0]
+        depth_raw_json = connection.execute("SELECT raw_json FROM ws_depth_events").fetchone()[0]
+        ws_raw_json = connection.execute("SELECT raw_json FROM ws_events").fetchone()[0]
 
     assert depth_rows >= 1
     assert liq_rows >= 1
     assert trade_rows >= 1
     assert heartbeat_rows >= 3
+    assert '"E":' in depth_raw_json
+    assert '"U":' in depth_raw_json
+    assert '"E":' in ws_raw_json
 
 
 def test_live_event_store_cleanup_prunes_old_rows_but_keeps_recent(tmp_path: Path) -> None:

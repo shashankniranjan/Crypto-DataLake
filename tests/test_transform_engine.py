@@ -6,7 +6,10 @@ import pytest
 from binance_minute_lake.core.schema import canonical_column_names
 from binance_minute_lake.pipeline.orchestrator import MinuteIngestionPipeline
 from binance_minute_lake.sources.websocket import LiveMinuteFeatures
-from binance_minute_lake.transforms.minute_builder import MinuteTransformEngine
+from binance_minute_lake.transforms.minute_builder import (
+    MinuteTransformEngine,
+    build_live_feature_snapshot_frame,
+)
 
 
 def test_transform_engine_returns_canonical_columns() -> None:
@@ -425,3 +428,67 @@ def test_transform_engine_preserves_live_null_zero_semantics() -> None:
     assert row["liq_avg_fill_price"] is None
     assert row["liq_unfilled_ratio"] is None
     assert row["liq_unfilled_supported"] is True
+
+
+def test_build_live_feature_snapshot_frame_handles_late_populated_nullable_fields() -> None:
+    start = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
+    funding_time = int((start + timedelta(hours=8)).timestamp() * 1000)
+    records: list[LiveMinuteFeatures] = []
+
+    for offset in range(180):
+        minute = start + timedelta(minutes=offset)
+        timestamp_ms = int(minute.timestamp() * 1000)
+        kwargs: dict[str, object] = {}
+        if offset == 176:
+            kwargs.update(
+                has_ws_latency=True,
+                event_time=timestamp_ms + 1,
+                transact_time=timestamp_ms + 2,
+                arrival_time=timestamp_ms + 3,
+                ws_latency_bad=True,
+            )
+        if offset == 177:
+            kwargs.update(
+                has_depth=True,
+                update_id_start=123,
+                update_id_end=456,
+                price_impact_100k=0.004,
+                impact_fillable=True,
+                depth_degraded=False,
+            )
+        if offset == 178:
+            kwargs.update(
+                has_liq=True,
+                liq_long_vol_usdt=1200.0,
+                liq_short_vol_usdt=0.0,
+                liq_long_count=2,
+                liq_short_count=0,
+                liq_unfilled_supported=True,
+            )
+        if offset == 179:
+            kwargs.update(
+                has_ls_ratio=True,
+                predicted_funding=0.0005,
+                next_funding_time=funding_time,
+            )
+        records.append(LiveMinuteFeatures(timestamp_ms=timestamp_ms, **kwargs))
+
+    frame = build_live_feature_snapshot_frame(records)
+
+    assert frame.height == 180
+    assert frame.schema["has_ws_latency"] == pl.Boolean
+    assert frame.schema["impact_fillable"] == pl.Boolean
+    assert frame.schema["liq_unfilled_supported"] == pl.Boolean
+    assert frame.schema["predicted_funding"] == pl.Float64
+    assert frame.schema["next_funding_time"] == pl.Int64
+
+    depth_row = frame.filter(pl.col("timestamp") == start + timedelta(minutes=177)).row(0, named=True)
+    liq_row = frame.filter(pl.col("timestamp") == start + timedelta(minutes=178)).row(0, named=True)
+    funding_row = frame.filter(pl.col("timestamp") == start + timedelta(minutes=179)).row(0, named=True)
+
+    assert depth_row["impact_fillable"] is True
+    assert depth_row["depth_degraded"] is False
+    assert liq_row["liq_unfilled_supported"] is True
+    assert liq_row["liq_short_count"] == 0
+    assert funding_row["predicted_funding"] == pytest.approx(0.0005)
+    assert funding_row["next_funding_time"] == funding_time

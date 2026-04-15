@@ -1,4 +1,4 @@
-.PHONY: install-dev lint format typecheck test run-once run-live
+.PHONY: install-dev lint format typecheck test run-once run-live run-live-price-service
 
 install-dev:
 	python -m pip install -e .[dev]
@@ -20,3 +20,6 @@ run-once:
 
 run-live:
 	./scripts/run-live.sh
+
+run-live-price-service:
+	./scripts/run-live-price-service.sh

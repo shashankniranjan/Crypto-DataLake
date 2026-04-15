@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 
@@ -84,6 +86,20 @@ def test_rest_client_parses_long_short_ratio_endpoints() -> None:
                     }
                 ],
             )
+        if request.url.path.endswith("/topLongShortPositionRatio"):
+            return httpx.Response(
+                status_code=200,
+                request=request,
+                json=[
+                    {
+                        "symbol": "BTCUSDT",
+                        "longShortRatio": "1.40",
+                        "longAccount": "0.58",
+                        "shortAccount": "0.42",
+                        "timestamp": 1_735_689_600_000,
+                    }
+                ],
+            )
         return httpx.Response(
             status_code=200,
             request=request,
@@ -104,11 +120,56 @@ def test_rest_client_parses_long_short_ratio_endpoints() -> None:
     )
     try:
         top = client.fetch_top_trader_long_short_account_ratio("BTCUSDT", period="5m")
+        position = client.fetch_top_trader_long_short_position_ratio("BTCUSDT", period="5m")
         global_ratio = client.fetch_global_long_short_account_ratio("BTCUSDT", period="5m")
     finally:
         client.close()
 
     assert top[0]["ratio"] == 1.25
     assert top[0]["long_account"] == 0.55
+    assert position[0]["ratio"] == 1.40
+    assert position[0]["long_account"] == 0.58
     assert global_ratio[0]["ratio"] == 1.10
     assert global_ratio[0]["short_account"] == 0.47
+
+
+def test_rest_client_parses_premium_index_klines() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/premiumIndexKlines")
+        return httpx.Response(
+            status_code=200,
+            request=request,
+            json=[
+                [
+                    1_735_689_600_000,
+                    "0.0010",
+                    "0.0015",
+                    "0.0009",
+                    "0.0012",
+                    "0",
+                    1_735_689_899_999,
+                    "0",
+                    1,
+                    "0",
+                    "0",
+                    "0",
+                ]
+            ],
+        )
+
+    client = BinanceRESTClient(
+        base_url="https://fapi.binance.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        rows = client.fetch_premium_index_klines(
+            "BTCUSDT",
+            datetime(2025, 1, 1, tzinfo=UTC),
+            datetime(2025, 1, 1, 0, 5, tzinfo=UTC),
+            interval="5m",
+        )
+    finally:
+        client.close()
+
+    assert rows[0]["premium_index_open"] == 0.001
+    assert rows[0]["premium_index_close"] == 0.0012

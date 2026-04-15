@@ -1,12 +1,70 @@
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 
 import polars as pl
 
 from binance_minute_lake.core.schema import canonical_column_names, dtype_map
 from binance_minute_lake.sources.websocket import LiveMinuteFeatures
+
+_EMPTY_TIMESTAMP_FRAME = pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+_LIVE_FEATURE_SCHEMA = {
+    "timestamp_ms": pl.Int64,
+    "has_ws_latency": pl.Boolean,
+    "has_depth": pl.Boolean,
+    "has_liq": pl.Boolean,
+    "has_ls_ratio": pl.Boolean,
+    "event_time": pl.Int64,
+    "transact_time": pl.Int64,
+    "arrival_time": pl.Int64,
+    "latency_engine": pl.Int64,
+    "latency_network": pl.Int64,
+    "ws_latency_bad": pl.Boolean,
+    "update_id_start": pl.Int64,
+    "update_id_end": pl.Int64,
+    "price_impact_100k": pl.Float64,
+    "impact_fillable": pl.Boolean,
+    "depth_degraded": pl.Boolean,
+    "liq_long_vol_usdt": pl.Float64,
+    "liq_short_vol_usdt": pl.Float64,
+    "liq_long_count": pl.Int64,
+    "liq_short_count": pl.Int64,
+    "liq_avg_fill_price": pl.Float64,
+    "liq_unfilled_ratio": pl.Float64,
+    "liq_unfilled_supported": pl.Boolean,
+    "predicted_funding": pl.Float64,
+    "next_funding_time": pl.Int64,
+}
+_LIVE_FEATURE_FIELDS = {field.name for field in fields(LiveMinuteFeatures)}
+if _LIVE_FEATURE_FIELDS != set(_LIVE_FEATURE_SCHEMA):
+    missing_schema = sorted(_LIVE_FEATURE_FIELDS - set(_LIVE_FEATURE_SCHEMA))
+    extra_schema = sorted(set(_LIVE_FEATURE_SCHEMA) - _LIVE_FEATURE_FIELDS)
+    raise RuntimeError(
+        "Live feature schema drift detected. "
+        f"Missing schema entries: {missing_schema}; extra schema entries: {extra_schema}"
+    )
+
+
+def build_live_feature_snapshot_frame(records: list[LiveMinuteFeatures]) -> pl.DataFrame:
+    if not records:
+        return _EMPTY_TIMESTAMP_FRAME
+
+    columns = {
+        name: pl.Series(
+            name=name,
+            values=[getattr(item, name) for item in records],
+            dtype=dtype,
+            strict=False,
+        )
+        for name, dtype in _LIVE_FEATURE_SCHEMA.items()
+    }
+    return pl.DataFrame(columns).with_columns(
+        pl.from_epoch(pl.col("timestamp_ms"), time_unit="ms")
+        .dt.replace_time_zone("UTC")
+        .dt.truncate("1m")
+        .alias("timestamp")
+    )
 
 
 class MinuteTransformEngine:
@@ -69,7 +127,7 @@ class MinuteTransformEngine:
         start = start_minute.astimezone(UTC)
         end = end_minute.astimezone(UTC)
         if end < start:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
         return pl.DataFrame(
             {
                 "timestamp": pl.datetime_range(
@@ -95,7 +153,7 @@ class MinuteTransformEngine:
 
     def _klines_frame(self, records: list[dict[str, object]]) -> pl.DataFrame:
         if not records:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
         return (
             pl.DataFrame(records)
             .with_columns(self._to_minute_timestamp("open_time"))
@@ -116,7 +174,7 @@ class MinuteTransformEngine:
 
     def _mark_price_frame(self, records: list[dict[str, object]]) -> pl.DataFrame:
         if not records:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
         return (
             pl.DataFrame(records)
             .with_columns(self._to_minute_timestamp("open_time"))
@@ -126,7 +184,7 @@ class MinuteTransformEngine:
 
     def _index_price_frame(self, records: list[dict[str, object]]) -> pl.DataFrame:
         if not records:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
         return (
             pl.DataFrame(records)
             .with_columns(self._to_minute_timestamp("open_time"))
@@ -136,7 +194,7 @@ class MinuteTransformEngine:
 
     def _agg_trade_frame(self, records: list[dict[str, object]]) -> pl.DataFrame:
         if not records:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
 
         trades = (
             pl.DataFrame(records)
@@ -202,7 +260,7 @@ class MinuteTransformEngine:
 
     def _book_ticker_frame(self, records: list[dict[str, object]]) -> pl.DataFrame:
         if not records:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
 
         ticker = (
             pl.DataFrame(records)
@@ -239,7 +297,7 @@ class MinuteTransformEngine:
 
     def _funding_frame(self, records: list[dict[str, object]]) -> pl.DataFrame:
         if not records:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
         return (
             pl.DataFrame(records)
             .with_columns(self._to_minute_timestamp("funding_time"))
@@ -250,7 +308,7 @@ class MinuteTransformEngine:
 
     def _premium_frame(self, records: list[dict[str, object]]) -> pl.DataFrame:
         if not records:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
         return (
             pl.DataFrame(records)
             .with_columns(self._to_minute_timestamp("event_time"))
@@ -270,12 +328,12 @@ class MinuteTransformEngine:
 
     def _metrics_frame(self, records: list[dict[str, object]]) -> pl.DataFrame:
         if not records:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
 
         frame = pl.DataFrame(records)
 
         if "create_time" not in frame.columns:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
+            return _EMPTY_TIMESTAMP_FRAME
 
         create_time_expr = pl.col("create_time")
         if frame.schema["create_time"] == pl.Utf8:
@@ -397,10 +455,8 @@ class MinuteTransformEngine:
 
     def _live_frame(self, records: list[LiveMinuteFeatures]) -> pl.DataFrame:
         if not records:
-            return pl.DataFrame({"timestamp": []}, schema={"timestamp": pl.Datetime("ms", "UTC")})
-        frame = pl.DataFrame([asdict(item) for item in records]).with_columns(
-            self._to_minute_timestamp("timestamp_ms")
-        )
+            return _EMPTY_TIMESTAMP_FRAME
+        frame = build_live_feature_snapshot_frame(records)
         return (
             frame.group_by("timestamp")
             .agg(

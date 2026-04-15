@@ -105,6 +105,18 @@ def _p95_int(values: list[int]) -> int | None:
     return int(ordered[rank - 1])
 
 
+def _bool_to_db(value: bool | None) -> int | None:
+    if value is None:
+        return None
+    return 1 if value else 0
+
+
+def _bool_from_db(value: Any) -> bool | None:
+    if value is None:
+        return None
+    return bool(int(value))
+
+
 @dataclass(frozen=True, slots=True)
 class LiveMinuteFeatures:
     timestamp_ms: int
@@ -483,6 +495,39 @@ class LiveEventStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS minute_live_features (
+                    symbol TEXT NOT NULL,
+                    minute_ts INTEGER NOT NULL,
+                    has_ws_latency INTEGER NOT NULL,
+                    has_depth INTEGER NOT NULL,
+                    has_liq INTEGER NOT NULL,
+                    has_ls_ratio INTEGER NOT NULL,
+                    event_time INTEGER,
+                    transact_time INTEGER,
+                    arrival_time INTEGER,
+                    latency_engine INTEGER,
+                    latency_network INTEGER,
+                    ws_latency_bad INTEGER,
+                    update_id_start INTEGER,
+                    update_id_end INTEGER,
+                    price_impact_100k REAL,
+                    impact_fillable INTEGER,
+                    depth_degraded INTEGER,
+                    liq_long_vol_usdt REAL,
+                    liq_short_vol_usdt REAL,
+                    liq_long_count INTEGER,
+                    liq_short_count INTEGER,
+                    liq_avg_fill_price REAL,
+                    liq_unfilled_ratio REAL,
+                    liq_unfilled_supported INTEGER,
+                    predicted_funding REAL,
+                    next_funding_time INTEGER,
+                    PRIMARY KEY (symbol, minute_ts)
+                )
+                """
+            )
 
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_ws_events_symbol_arrival ON ws_events(symbol, arrival_time)"
@@ -507,6 +552,10 @@ class LiveEventStore:
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_consumer_heartbeats_minute_ts ON consumer_heartbeats(minute_ts)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_minute_live_features_minute_ts "
+                "ON minute_live_features(minute_ts)"
             )
             connection.commit()
 
@@ -669,6 +718,81 @@ class LiveEventStore:
             )
             connection.commit()
 
+    def upsert_minute_features(
+        self,
+        *,
+        symbol: str,
+        features: LiveMinuteFeatures,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO minute_live_features(
+                    symbol, minute_ts, has_ws_latency, has_depth, has_liq, has_ls_ratio,
+                    event_time, transact_time, arrival_time, latency_engine, latency_network,
+                    ws_latency_bad, update_id_start, update_id_end, price_impact_100k,
+                    impact_fillable, depth_degraded, liq_long_vol_usdt, liq_short_vol_usdt,
+                    liq_long_count, liq_short_count, liq_avg_fill_price, liq_unfilled_ratio,
+                    liq_unfilled_supported, predicted_funding, next_funding_time
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, minute_ts)
+                DO UPDATE SET
+                    has_ws_latency=excluded.has_ws_latency,
+                    has_depth=excluded.has_depth,
+                    has_liq=excluded.has_liq,
+                    has_ls_ratio=excluded.has_ls_ratio,
+                    event_time=excluded.event_time,
+                    transact_time=excluded.transact_time,
+                    arrival_time=excluded.arrival_time,
+                    latency_engine=excluded.latency_engine,
+                    latency_network=excluded.latency_network,
+                    ws_latency_bad=excluded.ws_latency_bad,
+                    update_id_start=excluded.update_id_start,
+                    update_id_end=excluded.update_id_end,
+                    price_impact_100k=excluded.price_impact_100k,
+                    impact_fillable=excluded.impact_fillable,
+                    depth_degraded=excluded.depth_degraded,
+                    liq_long_vol_usdt=excluded.liq_long_vol_usdt,
+                    liq_short_vol_usdt=excluded.liq_short_vol_usdt,
+                    liq_long_count=excluded.liq_long_count,
+                    liq_short_count=excluded.liq_short_count,
+                    liq_avg_fill_price=excluded.liq_avg_fill_price,
+                    liq_unfilled_ratio=excluded.liq_unfilled_ratio,
+                    liq_unfilled_supported=excluded.liq_unfilled_supported,
+                    predicted_funding=excluded.predicted_funding,
+                    next_funding_time=excluded.next_funding_time
+                """,
+                (
+                    symbol.upper(),
+                    features.timestamp_ms,
+                    _bool_to_db(features.has_ws_latency) or 0,
+                    _bool_to_db(features.has_depth) or 0,
+                    _bool_to_db(features.has_liq) or 0,
+                    _bool_to_db(features.has_ls_ratio) or 0,
+                    features.event_time,
+                    features.transact_time,
+                    features.arrival_time,
+                    features.latency_engine,
+                    features.latency_network,
+                    _bool_to_db(features.ws_latency_bad),
+                    features.update_id_start,
+                    features.update_id_end,
+                    features.price_impact_100k,
+                    _bool_to_db(features.impact_fillable),
+                    _bool_to_db(features.depth_degraded),
+                    features.liq_long_vol_usdt,
+                    features.liq_short_vol_usdt,
+                    features.liq_long_count,
+                    features.liq_short_count,
+                    features.liq_avg_fill_price,
+                    features.liq_unfilled_ratio,
+                    _bool_to_db(features.liq_unfilled_supported),
+                    features.predicted_funding,
+                    features.next_funding_time,
+                ),
+            )
+            connection.commit()
+
     def cleanup_by_retention(
         self,
         *,
@@ -775,6 +899,53 @@ class LiveEventStore:
         symbol_upper = symbol.upper() if symbol is not None else None
 
         with self._connect() as connection:
+            persisted_query = """
+                SELECT
+                    minute_ts, has_ws_latency, has_depth, has_liq, has_ls_ratio, event_time,
+                    transact_time, arrival_time, latency_engine, latency_network, ws_latency_bad,
+                    update_id_start, update_id_end, price_impact_100k, impact_fillable,
+                    depth_degraded, liq_long_vol_usdt, liq_short_vol_usdt, liq_long_count,
+                    liq_short_count, liq_avg_fill_price, liq_unfilled_ratio,
+                    liq_unfilled_supported, predicted_funding, next_funding_time
+                FROM minute_live_features
+                WHERE minute_ts = ?
+            """
+            persisted_params: list[int | str] = [minute_key]
+            if symbol_upper is not None:
+                persisted_query += " AND symbol = ?"
+                persisted_params.append(symbol_upper)
+            persisted_query += " ORDER BY symbol ASC LIMIT 1"
+            persisted_row = connection.execute(persisted_query, persisted_params).fetchone()
+
+            if persisted_row is not None:
+                return LiveMinuteFeatures(
+                    timestamp_ms=int(persisted_row[0]),
+                    has_ws_latency=bool(int(persisted_row[1])),
+                    has_depth=bool(int(persisted_row[2])),
+                    has_liq=bool(int(persisted_row[3])),
+                    has_ls_ratio=bool(int(persisted_row[4])),
+                    event_time=_coerce_int(persisted_row[5]),
+                    transact_time=_coerce_int(persisted_row[6]),
+                    arrival_time=_coerce_int(persisted_row[7]),
+                    latency_engine=_coerce_int(persisted_row[8]),
+                    latency_network=_coerce_int(persisted_row[9]),
+                    ws_latency_bad=_bool_from_db(persisted_row[10]),
+                    update_id_start=_coerce_int(persisted_row[11]),
+                    update_id_end=_coerce_int(persisted_row[12]),
+                    price_impact_100k=_coerce_float(persisted_row[13]),
+                    impact_fillable=_bool_from_db(persisted_row[14]),
+                    depth_degraded=_bool_from_db(persisted_row[15]),
+                    liq_long_vol_usdt=_coerce_float(persisted_row[16]),
+                    liq_short_vol_usdt=_coerce_float(persisted_row[17]),
+                    liq_long_count=_coerce_int(persisted_row[18]),
+                    liq_short_count=_coerce_int(persisted_row[19]),
+                    liq_avg_fill_price=_coerce_float(persisted_row[20]),
+                    liq_unfilled_ratio=_coerce_float(persisted_row[21]),
+                    liq_unfilled_supported=_bool_from_db(persisted_row[22]),
+                    predicted_funding=_coerce_float(persisted_row[23]),
+                    next_funding_time=_coerce_int(persisted_row[24]),
+                )
+
             depth_query = """
                 SELECT event_time, arrival_time, first_update_id, final_update_id
                 FROM ws_depth_events
@@ -895,7 +1066,9 @@ class LiveEventStore:
                     continue
 
                 original_qty = _coerce_float(order_payload.get("q"))
-                executed_qty = _coerce_float(order_payload.get("l"))
+                executed_qty = _coerce_float(order_payload.get("z"))
+                if executed_qty is None:
+                    executed_qty = _coerce_float(order_payload.get("l"))
                 if original_qty is None or executed_qty is None or original_qty <= 0:
                     unfilled_supported = False
                     continue
@@ -942,6 +1115,71 @@ class LiveEventStore:
             predicted_funding=None,
             next_funding_time=None,
         )
+
+    def snapshots_for_range(
+        self,
+        *,
+        start_ms: int,
+        end_ms: int,
+        symbol: str | None = None,
+    ) -> dict[int, LiveMinuteFeatures]:
+        """Bulk-fetch all pre-computed minute live features for [start_ms, end_ms].
+
+        Returns a dict keyed by minute_ts. Only includes minutes that have data in
+        the minute_live_features table. Avoids the N individual queries of repeated
+        snapshot_for_minute calls for large windows.
+        """
+        symbol_upper = symbol.upper() if symbol is not None else None
+        query = """
+            SELECT
+                minute_ts, has_ws_latency, has_depth, has_liq, has_ls_ratio, event_time,
+                transact_time, arrival_time, latency_engine, latency_network, ws_latency_bad,
+                update_id_start, update_id_end, price_impact_100k, impact_fillable,
+                depth_degraded, liq_long_vol_usdt, liq_short_vol_usdt, liq_long_count,
+                liq_short_count, liq_avg_fill_price, liq_unfilled_ratio,
+                liq_unfilled_supported, predicted_funding, next_funding_time
+            FROM minute_live_features
+            WHERE minute_ts >= ? AND minute_ts <= ?
+        """
+        params: list[int | str] = [start_ms, end_ms]
+        if symbol_upper is not None:
+            query += " AND symbol = ?"
+            params.append(symbol_upper)
+
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+
+        result: dict[int, LiveMinuteFeatures] = {}
+        for row in rows:
+            minute_ts = int(row[0])
+            result[minute_ts] = LiveMinuteFeatures(
+                timestamp_ms=minute_ts,
+                has_ws_latency=bool(int(row[1])),
+                has_depth=bool(int(row[2])),
+                has_liq=bool(int(row[3])),
+                has_ls_ratio=bool(int(row[4])),
+                event_time=_coerce_int(row[5]),
+                transact_time=_coerce_int(row[6]),
+                arrival_time=_coerce_int(row[7]),
+                latency_engine=_coerce_int(row[8]),
+                latency_network=_coerce_int(row[9]),
+                ws_latency_bad=_bool_from_db(row[10]),
+                update_id_start=_coerce_int(row[11]),
+                update_id_end=_coerce_int(row[12]),
+                price_impact_100k=_coerce_float(row[13]),
+                impact_fillable=_bool_from_db(row[14]),
+                depth_degraded=_bool_from_db(row[15]),
+                liq_long_vol_usdt=_coerce_float(row[16]),
+                liq_short_vol_usdt=_coerce_float(row[17]),
+                liq_long_count=_coerce_int(row[18]),
+                liq_short_count=_coerce_int(row[19]),
+                liq_avg_fill_price=_coerce_float(row[20]),
+                liq_unfilled_ratio=_coerce_float(row[21]),
+                liq_unfilled_supported=_bool_from_db(row[22]),
+                predicted_funding=_coerce_float(row[23]),
+                next_funding_time=_coerce_int(row[24]),
+            )
+        return result
 
     def agg_trades_for_window(
         self,
@@ -1144,6 +1382,7 @@ class InMemoryLiveCollector(LiveCollector):
     def mark_ls_ratio_heartbeat(self, minute_timestamp_ms: int, *, has_data: bool) -> None:
         with self._lock:
             self._bucket(minute_timestamp_ms).has_ls_ratio = has_data
+            self._persist_minute_snapshot_locked(floor_to_minute_ms(minute_timestamp_ms))
         self.mark_consumer_heartbeat(
             consumer_name=CONSUMER_LS_RATIO,
             minute_timestamp_ms=minute_timestamp_ms,
@@ -1219,6 +1458,7 @@ class InMemoryLiveCollector(LiveCollector):
                     bucket = self._bucket(minute_key)
                     bucket.depth_degraded = True
                     bucket.impact_fillable = False
+                    self._persist_minute_snapshot_locked(minute_key)
                 raise
 
             if minute_timestamp_ms is not None and book.is_synchronized and not book.degraded:
@@ -1233,6 +1473,7 @@ class InMemoryLiveCollector(LiveCollector):
                 bucket.depth_spread_pct = spread_pct
                 bucket.depth_avg_bid_qty = avg_bid_qty
                 bucket.depth_avg_ask_qty = avg_ask_qty
+                self._persist_minute_snapshot_locked(minute_key)
 
     def ingest_depth_diff(
         self,
@@ -1291,7 +1532,7 @@ class InMemoryLiveCollector(LiveCollector):
                     final_update_id=final_update_id,
                     bids=bid_tuple,
                     asks=ask_tuple,
-                    raw_payload=None,
+                    raw_payload=raw_payload,
                 )
                 self._event_store.append_event(
                     stream=f"{symbol.lower()}@depth@100ms",
@@ -1299,7 +1540,7 @@ class InMemoryLiveCollector(LiveCollector):
                     event_time=event_time,
                     transact_time=transact_time,
                     arrival_time=arrival,
-                    raw_payload=None,
+                    raw_payload=raw_payload,
                 )
 
             symbol_upper = symbol.upper()
@@ -1329,7 +1570,10 @@ class InMemoryLiveCollector(LiveCollector):
                 bucket.depth_degraded = True
                 bucket.impact_fillable = False
                 bucket.price_impact_100k = None
+                self._persist_minute_snapshot_locked(minute_key)
                 raise
+
+            self._persist_minute_snapshot_locked(minute_key)
 
     def ingest_liquidation_event(
         self,
@@ -1380,6 +1624,7 @@ class InMemoryLiveCollector(LiveCollector):
                     quantity=event.quantity,
                     raw_payload=raw_payload,
                 )
+            self._persist_minute_snapshot_locked(minute_key)
 
     def ingest_predicted_funding(
         self,
@@ -1395,6 +1640,7 @@ class InMemoryLiveCollector(LiveCollector):
             bucket = self._bucket(minute_key)
             bucket.predicted_funding = predicted_funding
             bucket.next_funding_time = next_funding_time
+            self._persist_minute_snapshot_locked(minute_key)
 
     def snapshot_for_minute(self, minute_timestamp_ms: int) -> LiveMinuteFeatures:
         minute_key = floor_to_minute_ms(minute_timestamp_ms)
@@ -1515,6 +1761,38 @@ class InMemoryLiveCollector(LiveCollector):
                 next_funding_time=bucket.next_funding_time,
             )
 
+    def snapshots_for_range(self, start_ms: int, end_ms: int) -> dict[int, LiveMinuteFeatures]:
+        """Bulk-fetch all minute live features for [start_ms, end_ms].
+
+        Replaces N individual snapshot_for_minute calls with one DB range query plus
+        individual calls only for the (typically small) set of in-memory keys.
+        Returns a dict keyed by minute_ts (only minutes with data are included).
+        """
+        start_key = floor_to_minute_ms(start_ms)
+        end_key = floor_to_minute_ms(end_ms)
+
+        # Single bulk query for all pre-computed DB snapshots.
+        db_snapshots: dict[int, LiveMinuteFeatures] = {}
+        if self._event_store is not None:
+            db_snapshots = self._event_store.snapshots_for_range(
+                start_ms=start_key,
+                end_ms=end_key,
+                symbol=self._symbol,
+            )
+
+        result: dict[int, LiveMinuteFeatures] = dict(db_snapshots)
+
+        # Find in-memory keys in range (copy key list under lock, then release).
+        # In-memory data is authoritative for recent minutes and overrides DB.
+        with self._lock:
+            in_memory_keys = [k for k in self._minutes if start_key <= k <= end_key]
+
+        for minute_key in in_memory_keys:
+            snap = self.snapshot_for_minute(minute_key)
+            result[minute_key] = snap
+
+        return result
+
     def agg_trades_for_window(
         self,
         *,
@@ -1573,6 +1851,14 @@ class InMemoryLiveCollector(LiveCollector):
         normalized = symbol.strip().upper()
         if normalized:
             self._symbol = normalized
+
+    def _persist_minute_snapshot_locked(self, minute_timestamp_ms: int) -> None:
+        if self._event_store is None or self._symbol is None:
+            return
+        self._event_store.upsert_minute_features(
+            symbol=self._symbol,
+            features=self.snapshot_for_minute(minute_timestamp_ms),
+        )
 
 
 class BinanceWsPayloadProcessor:
@@ -1658,7 +1944,11 @@ class BinanceWsPayloadProcessor:
 
         average_price = _coerce_float(order_payload.get("ap"))
         price = average_price if average_price is not None else _coerce_float(order_payload.get("p"))
-        quantity = _coerce_float(order_payload.get("q"))
+        original_qty = _coerce_float(order_payload.get("q"))
+        executed_qty = _coerce_float(order_payload.get("z"))
+        if executed_qty is None:
+            executed_qty = _coerce_float(order_payload.get("l"))
+        quantity = executed_qty if executed_qty is not None and executed_qty > 0 else original_qty
         if price is None or quantity is None or quantity <= 0:
             return
 
@@ -1669,8 +1959,6 @@ class BinanceWsPayloadProcessor:
             return
 
         symbol = str(order_payload.get("s") or payload.get("s") or self._symbol_from_stream(stream_name))
-        orig_qty = _coerce_float(order_payload.get("q"))
-        executed_qty = _coerce_float(order_payload.get("l"))
 
         self._collector.ingest_liquidation_event(
             LiquidationOrderEvent(
@@ -1680,7 +1968,7 @@ class BinanceWsPayloadProcessor:
                 price=price,
                 quantity=quantity,
                 arrival_time=arrival_time_ms,
-                orig_quantity=orig_qty,
+                orig_quantity=original_qty,
                 executed_quantity=executed_qty,
             ),
             raw_payload=payload,

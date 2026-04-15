@@ -3,9 +3,9 @@ from __future__ import annotations
 import io
 import logging
 import zipfile
+from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
 
 import polars as pl
 
@@ -123,15 +123,31 @@ class VisionLoader:
                 symbol=symbol,
                 trade_date=day,
                 schema={
+                    "agg_trade_id": pl.Int64,
                     "aggregate_trade_id": pl.Int64,
                     "price": pl.Float64,
                     "quantity": pl.Float64,
                     "first_trade_id": pl.Int64,
                     "last_trade_id": pl.Int64,
+                    "transact_time": pl.Int64,
                     "timestamp": pl.Int64,
+                    "is_buyer_maker": pl.Boolean,
                     "was_buyer_maker": pl.Boolean,
                 },
-            ).rename({"quantity": "qty", "timestamp": "transact_time", "was_buyer_maker": "is_buyer_maker"})
+            ).with_columns(
+                pl.coalesce([pl.col("agg_trade_id"), pl.col("aggregate_trade_id")]).alias("agg_trade_id"),
+                pl.col("quantity").alias("qty"),
+                pl.coalesce([pl.col("transact_time"), pl.col("timestamp")]).alias("transact_time"),
+                pl.coalesce([pl.col("is_buyer_maker"), pl.col("was_buyer_maker")]).alias("is_buyer_maker"),
+            ).select(
+                "agg_trade_id",
+                "price",
+                "qty",
+                "first_trade_id",
+                "last_trade_id",
+                "transact_time",
+                "is_buyer_maker",
+            )
             for day in self._days_in_window(start, end)
         ]
         return self._filter_and_export(frames, start, end, ts_column="transact_time")
@@ -174,9 +190,9 @@ class VisionLoader:
                     "symbol": pl.Utf8,
                     "sum_open_interest": pl.Float64,
                     "sum_open_interest_value": pl.Float64,
-                    "count_toptrader_long_short_ratio": pl.Int64,
+                    "count_toptrader_long_short_ratio": pl.Float64,
                     "sum_toptrader_long_short_ratio": pl.Float64,
-                    "count_long_short_ratio": pl.Int64,
+                    "count_long_short_ratio": pl.Float64,
                     "sum_taker_long_short_vol_ratio": pl.Float64,
                 },
             ).with_columns(
@@ -184,7 +200,9 @@ class VisionLoader:
                 .str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S", strict=False)
                 .dt.replace_time_zone("UTC")
                 .dt.timestamp("ms")
-                .alias("create_time")
+                .alias("create_time"),
+                pl.col("sum_open_interest").alias("oi_contracts"),
+                pl.col("sum_open_interest_value").alias("oi_value_usdt"),
             )
             for day in self._days_in_window(start, end)
         ]
@@ -258,5 +276,10 @@ class VisionLoader:
         return df
 
     def _cache_path(self, stream: str, symbol: str, trade_date: date, interval: str) -> Path:
-        filename = self._client.expected_filename(stream=stream, symbol=symbol, trade_date=trade_date, interval=interval)
+        filename = self._client.expected_filename(
+            stream=stream,
+            symbol=symbol,
+            trade_date=trade_date,
+            interval=interval,
+        )
         return self._cache_dir / stream / symbol.upper() / filename

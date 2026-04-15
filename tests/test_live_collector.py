@@ -163,6 +163,40 @@ def test_liquidation_event_driven_semantics() -> None:
     assert populated.liq_unfilled_supported is True
 
 
+def test_force_order_uses_accumulated_filled_quantity_for_notional_and_unfilled_ratio() -> None:
+    from binance_minute_lake.sources.websocket import BinanceWsPayloadProcessor
+
+    collector = InMemoryLiveCollector(liquidation_unfilled_supported=True)
+    processor = BinanceWsPayloadProcessor(collector=collector, symbol="BTCUSDT")
+    minute = floor_to_minute_ms(_ms(datetime(2026, 1, 15, 10, 0, tzinfo=UTC)))
+
+    processor.process_stream_payload(
+        stream_name="btcusdt@forceOrder",
+        payload={
+            "e": "forceOrder",
+            "E": minute + 1_000,
+            "o": {
+                "s": "BTCUSDT",
+                "S": "SELL",
+                "p": "100.0",
+                "ap": "100.0",
+                "q": "10.0",
+                "l": "2.0",
+                "z": "6.0",
+                "T": minute + 1_000,
+            },
+        },
+        arrival_time_ms=minute + 1_010,
+    )
+
+    snapshot = collector.snapshot_for_minute(minute)
+    assert snapshot.has_liq is True
+    assert snapshot.liq_long_vol_usdt == 600.0
+    assert snapshot.liq_avg_fill_price == 100.0
+    assert snapshot.liq_unfilled_supported is True
+    assert snapshot.liq_unfilled_ratio == pytest.approx(0.4)
+
+
 def test_ws_latency_bad_is_null_when_source_absent() -> None:
     collector = InMemoryLiveCollector()
     minute = floor_to_minute_ms(_ms(datetime(2026, 1, 15, 10, 0, tzinfo=UTC)))
@@ -243,6 +277,7 @@ def test_snapshot_recovers_live_features_from_event_store(tmp_path: Path) -> Non
             }
         },
     )
+    expected = writer_collector.snapshot_for_minute(minute)
 
     recovered_collector = InMemoryLiveCollector(event_store=store, symbol="BTCUSDT")
     recovered = recovered_collector.snapshot_for_minute(minute)
@@ -254,6 +289,9 @@ def test_snapshot_recovers_live_features_from_event_store(tmp_path: Path) -> Non
     assert recovered.transact_time == minute + 990
     assert recovered.update_id_start == 101
     assert recovered.update_id_end == 105
+    assert recovered.price_impact_100k == pytest.approx(expected.price_impact_100k)
+    assert recovered.impact_fillable is expected.impact_fillable
+    assert recovered.depth_degraded is expected.depth_degraded
     assert recovered.liq_long_count == 1
     assert recovered.liq_short_count == 0
     assert recovered.liq_unfilled_supported is True

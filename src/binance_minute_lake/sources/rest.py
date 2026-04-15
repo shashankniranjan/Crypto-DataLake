@@ -230,6 +230,35 @@ class BinanceRESTClient:
             for item in payload
         ]
 
+    def fetch_premium_index_klines(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+        interval: str = "1m",
+        limit: int = 1500,
+    ) -> list[dict[str, Any]]:
+        payload = self._get(
+            "/fapi/v1/premiumIndexKlines",
+            {
+                "symbol": symbol.upper(),
+                "interval": interval,
+                "startTime": self._to_ms(start_time),
+                "endTime": self._to_ms(end_time),
+                "limit": limit,
+            },
+        )
+        return [
+            {
+                "open_time": int(item[0]),
+                "premium_index_open": float(item[1]),
+                "premium_index_high": float(item[2]),
+                "premium_index_low": float(item[3]),
+                "premium_index_close": float(item[4]),
+            }
+            for item in payload
+        ]
+
     def fetch_agg_trades(
         self,
         symbol: str,
@@ -378,6 +407,69 @@ class BinanceRESTClient:
                 "ratio": float(item["longShortRatio"]),
                 "long_account": float(item["longAccount"]),
                 "short_account": float(item["shortAccount"]),
+            }
+            for item in payload
+        ]
+
+    def fetch_top_trader_long_short_position_ratio(
+        self,
+        symbol: str,
+        *,
+        period: str = "5m",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": limit,
+        }
+        if start_time is not None:
+            params["startTime"] = self._to_ms(start_time)
+        if end_time is not None:
+            params["endTime"] = self._to_ms(end_time)
+
+        payload = self._get("/futures/data/topLongShortPositionRatio", params)
+        return [
+            {
+                "symbol": item["symbol"],
+                "data_time": int(item["timestamp"]),
+                "ratio": float(item["longShortRatio"]),
+                "long_account": float(item["longAccount"]),
+                "short_account": float(item["shortAccount"]),
+            }
+            for item in payload
+        ]
+
+    def fetch_open_interest_hist(
+        self,
+        symbol: str,
+        period: str = "5m",
+        start_time: datetime | None = None,
+        end_time: datetime | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Fetch historical open interest from /futures/data/openInterestHist.
+        Valid periods: 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d.
+        """
+        params: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "period": period,
+            "limit": limit,
+        }
+        if start_time is not None:
+            params["startTime"] = self._to_ms(start_time)
+        if end_time is not None:
+            params["endTime"] = self._to_ms(end_time)
+
+        payload = self._get("/futures/data/openInterestHist", params)
+        return [
+            {
+                "symbol": item["symbol"],
+                "oi_contracts": float(item["sumOpenInterest"]),
+                "oi_value_usdt": float(item["sumOpenInterestValue"]),
+                "create_time": int(item["timestamp"]),
             }
             for item in payload
         ]
