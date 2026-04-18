@@ -246,6 +246,7 @@ def test_live_event_store_cleanup_prunes_old_rows_but_keeps_recent(tmp_path: Pat
     assert cleanup.ws_depth_events_deleted == 1
     assert cleanup.ws_liq_events_deleted == 1
     assert cleanup.ws_trade_events_deleted == 1
+    assert cleanup.minute_live_features_deleted == 1
     assert cleanup.consumer_heartbeats_deleted == 3
 
     with closing(sqlite3.connect(tmp_path / "live_events.sqlite")) as connection:
@@ -253,12 +254,14 @@ def test_live_event_store_cleanup_prunes_old_rows_but_keeps_recent(tmp_path: Pat
         depth_rows = connection.execute("SELECT COUNT(*) FROM ws_depth_events").fetchone()[0]
         liq_rows = connection.execute("SELECT COUNT(*) FROM ws_liq_events").fetchone()[0]
         trade_rows = connection.execute("SELECT COUNT(*) FROM ws_trade_events").fetchone()[0]
+        feature_rows = connection.execute("SELECT COUNT(*) FROM minute_live_features").fetchone()[0]
         heartbeat_rows = connection.execute("SELECT COUNT(*) FROM consumer_heartbeats").fetchone()[0]
 
     assert ws_rows == 1
     assert depth_rows == 1
     assert liq_rows == 1
     assert trade_rows == 1
+    assert feature_rows == 1
     assert heartbeat_rows == 3
 
 

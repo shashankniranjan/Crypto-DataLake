@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from binance_minute_lake.core.binance_usage import record_binance_rest_response, record_binance_retry
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,14 +54,22 @@ class BinanceRESTClient:
                 last_transport_error = exc
                 if attempt >= self._retries:
                     raise
+                record_binance_retry()
                 self._sleep_before_retry(attempt=attempt, path=path, status_code=None, reason=exc.__class__.__name__)
                 continue
+
+            record_binance_rest_response(
+                path=path,
+                status_code=response.status_code,
+                headers={key.lower(): value for key, value in response.headers.items()},
+            )
 
             if response.status_code < 400:
                 return response.json()
 
             if self._is_retryable_status(response.status_code) and attempt < self._retries:
                 retry_after_seconds = self._parse_retry_after_seconds(response=response)
+                record_binance_retry()
                 self._sleep_before_retry(
                     attempt=attempt,
                     path=path,

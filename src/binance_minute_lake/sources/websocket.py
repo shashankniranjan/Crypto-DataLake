@@ -154,6 +154,7 @@ class LiveEventCleanupSummary:
     ws_depth_events_deleted: int
     ws_liq_events_deleted: int
     ws_trade_events_deleted: int
+    minute_live_features_deleted: int
     consumer_heartbeats_deleted: int
     vacuumed: bool
 
@@ -164,6 +165,7 @@ class LiveEventCleanupSummary:
             + self.ws_depth_events_deleted
             + self.ws_liq_events_deleted
             + self.ws_trade_events_deleted
+            + self.minute_live_features_deleted
             + self.consumer_heartbeats_deleted
         )
 
@@ -862,6 +864,13 @@ class LiveEventStore:
                 )
             )
 
+            minute_live_features_deleted = self._rows_deleted(
+                connection.execute(
+                    "DELETE FROM minute_live_features WHERE minute_ts < ?",
+                    (event_cutoff_ms,),
+                )
+            )
+
             consumer_heartbeats_deleted = self._rows_deleted(
                 connection.execute(
                     "DELETE FROM consumer_heartbeats WHERE minute_ts < ?",
@@ -884,6 +893,7 @@ class LiveEventStore:
             ws_depth_events_deleted=ws_depth_events_deleted,
             ws_liq_events_deleted=ws_liq_events_deleted,
             ws_trade_events_deleted=ws_trade_events_deleted,
+            minute_live_features_deleted=minute_live_features_deleted,
             consumer_heartbeats_deleted=consumer_heartbeats_deleted,
             vacuumed=vacuumed,
         )

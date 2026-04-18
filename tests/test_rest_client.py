@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
+from binance_minute_lake.core.binance_usage import binance_usage_scope
 from binance_minute_lake.sources.rest import BinanceRESTClient
 
 
@@ -173,3 +174,42 @@ def test_rest_client_parses_premium_index_klines() -> None:
 
     assert rows[0]["premium_index_open"] == 0.001
     assert rows[0]["premium_index_close"] == 0.0012
+
+
+def test_rest_client_tracks_used_weight_headers_in_usage_scope() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code=200,
+            request=request,
+            headers={"X-MBX-USED-WEIGHT-1M": "17"},
+            json={
+                "markPrice": "100.0",
+                "indexPrice": "99.0",
+                "lastFundingRate": "0.0001",
+                "nextFundingTime": 0,
+                "predictedFundingRate": "0.0002",
+                "time": 123,
+            },
+        )
+
+    client = BinanceRESTClient(
+        base_url="https://fapi.binance.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with binance_usage_scope("/api/v1/live-indicators") as usage_tracker:
+            client.fetch_premium_index("BTCUSDT")
+    finally:
+        client.close()
+
+    fields = usage_tracker.as_log_fields()
+    assert fields["binance_rest_call_count"] == 1
+    assert fields["binance_endpoint_counts"] == {"/fapi/v1/premiumIndex": 1}
+    assert fields["binance_observed_weight_headers"] == {
+        "x-mbx-used-weight-1m": {
+            "first": 17,
+            "last": 17,
+            "max": 17,
+            "delta_after_first": 0,
+        }
+    }

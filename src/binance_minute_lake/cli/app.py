@@ -216,6 +216,7 @@ def cleanup_live_state(
         f"depth={cleanup.ws_depth_events_deleted}, "
         f"liq={cleanup.ws_liq_events_deleted}, "
         f"trade={cleanup.ws_trade_events_deleted}, "
+        f"features={cleanup.minute_live_features_deleted}, "
         f"heartbeats={cleanup.consumer_heartbeats_deleted}, "
         f"vacuumed={cleanup.vacuumed}"
     )
@@ -373,6 +374,7 @@ def run_live_forever(
                             f"depth={cleanup.ws_depth_events_deleted}, "
                             f"liq={cleanup.ws_liq_events_deleted}, "
                             f"trade={cleanup.ws_trade_events_deleted}, "
+                            f"features={cleanup.minute_live_features_deleted}, "
                             f"heartbeats={cleanup.consumer_heartbeats_deleted}, "
                             f"vacuumed={cleanup.vacuumed}"
                         )

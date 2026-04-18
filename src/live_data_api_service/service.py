@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import inspect
 import logging
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from time import perf_counter
+from threading import Lock
+from time import monotonic, perf_counter
 from typing import Any, cast
 
 import polars as pl
 
+from binance_minute_lake.core.binance_usage import record_binance_cache_event
 from binance_minute_lake.state.store import SQLiteStateStore
 
 from .aggregation import aggregate_canonical_frame
@@ -22,7 +26,7 @@ from .capabilities import (
     plan_timeframe_fetch,
     response_capability_matrix,
 )
-from .repository import MinuteLakeRepository
+from .repository import HigherTimeframeRepository, MinuteLakeRepository
 from .timeframes import TimeframeSpec, normalize_symbol, parse_timeframe_requests, requested_window_start
 from .utils import (
     cast_canonical_frame,
@@ -55,11 +59,26 @@ class TimeframeCandleResult:
     metadata: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class _TimeframeCacheKey:
+    symbol: str
+    timeframe: str
+    limit: int
+    end_time: datetime
+
+
+@dataclass(slots=True)
+class _TimeframeCacheEntry:
+    result: TimeframeCandleResult
+    expires_at_monotonic: float
+
+
 class LiveDataApiService:
     def __init__(
         self,
         *,
         repository: MinuteLakeRepository,
+        higher_timeframe_repository: HigherTimeframeRepository | None = None,
         provider: object,
         default_limit: int,
         max_limit: int,
@@ -70,6 +89,7 @@ class LiveDataApiService:
         state_store: SQLiteStateStore | None = None,
         local_watermark_tolerance_minutes: int | None = None,
         include_deprecated_fields: bool = False,
+        enable_ws_warmup: bool = False,
         enable_local_symbol_fastpath: bool = True,
         local_preferred_symbols: Iterable[str] | None = None,
         local_symbol_require_full_coverage: bool = False,
@@ -80,8 +100,12 @@ class LiveDataApiService:
         btc_local_max_higher_tf_bars: int = 200,
         btc_force_binance_for_heavy_higher_tf: bool = True,
         fetch_planner_config: FetchPlannerConfig | None = None,
+        timeframe_cache_max_entries: int = 256,
+        timeframe_cache_stable_ttl_seconds: int = 21_600,
+        timeframe_cache_recent_ttl_seconds: int = 15,
     ) -> None:
         self._repository = repository
+        self._higher_timeframe_repository = higher_timeframe_repository
         self._provider = provider
         self._default_limit = default_limit
         self._max_limit = max_limit
@@ -92,6 +116,7 @@ class LiveDataApiService:
         self._state_store = state_store
         self._local_watermark_tolerance_minutes = local_watermark_tolerance_minutes
         self._include_deprecated_fields = include_deprecated_fields
+        self._enable_ws_warmup = enable_ws_warmup
         self._enable_local_symbol_fastpath = enable_local_symbol_fastpath
         raw_local_symbols = local_preferred_symbols if local_preferred_symbols is not None else ("BTCUSDT",)
         self._local_preferred_symbols = frozenset(
@@ -107,6 +132,11 @@ class LiveDataApiService:
         self._btc_local_max_higher_tf_bars = btc_local_max_higher_tf_bars
         self._btc_force_binance_for_heavy_higher_tf = btc_force_binance_for_heavy_higher_tf
         self._fetch_planner_config = fetch_planner_config or FetchPlannerConfig()
+        self._timeframe_cache_max_entries = max(timeframe_cache_max_entries, 0)
+        self._timeframe_cache_stable_ttl_seconds = max(timeframe_cache_stable_ttl_seconds, 0)
+        self._timeframe_cache_recent_ttl_seconds = max(timeframe_cache_recent_ttl_seconds, 0)
+        self._timeframe_cache_lock = Lock()
+        self._timeframe_cache: OrderedDict[_TimeframeCacheKey, _TimeframeCacheEntry] = OrderedDict()
 
     def close(self) -> None:
         close = getattr(self._provider, "close", None)
@@ -125,18 +155,22 @@ class LiveDataApiService:
         get_collector = getattr(self._ws_manager, "get_collector", None)
         touch = getattr(self._ws_manager, "touch", None)
 
-        # Non-shared symbols should warm the WS subscription on the first query,
-        # but live-only fields only become eligible for the *next* request.
+        # Non-shared symbols only reuse an already-running collector by default.
+        # Warmup can be re-enabled explicitly for the API service when needed.
         if callable(get_collector):
             existing = get_collector(symbol)
             if existing is not None:
                 if callable(touch):
                     return touch(symbol)
                 return existing
+            if not self._enable_ws_warmup:
+                return None
             if callable(touch):
                 touch(symbol)
             return None
 
+        if not self._enable_ws_warmup:
+            return None
         if callable(touch):
             touch(symbol)
         return None
@@ -152,6 +186,190 @@ class LiveDataApiService:
 
     def _is_local_preferred_symbol(self, symbol: str) -> bool:
         return self._enable_local_symbol_fastpath and symbol in self._local_preferred_symbols
+
+    @staticmethod
+    def _is_local_only_btc_symbol(symbol: str) -> bool:
+        return symbol == "BTCUSDT"
+
+    @staticmethod
+    def _clone_timeframe_result(
+        result: TimeframeCandleResult,
+        *,
+        latency_secs: float | None = None,
+    ) -> TimeframeCandleResult:
+        metadata = dict(result.metadata)
+        if latency_secs is not None:
+            metadata["latency_secs"] = latency_secs
+        return TimeframeCandleResult(frame=result.frame.clone(), metadata=metadata)
+
+    @staticmethod
+    def _timeframe_cache_key(
+        *,
+        symbol: str,
+        spec: TimeframeSpec,
+        limit: int,
+        resolved_end: datetime,
+    ) -> _TimeframeCacheKey:
+        return _TimeframeCacheKey(
+            symbol=symbol,
+            timeframe=spec.api_name,
+            limit=limit,
+            end_time=resolved_end,
+        )
+
+    def _timeframe_window_is_stable(self, spec: TimeframeSpec, resolved_end: datetime) -> bool:
+        bar_open = normalize_bar_timestamp(resolved_end, spec.minutes)
+        bar_close = bar_open + timedelta(minutes=spec.minutes - 1)
+        return last_completed_utc_minute() >= bar_close
+
+    def _timeframe_cache_ttl_seconds(self, spec: TimeframeSpec, resolved_end: datetime) -> int:
+        if self._timeframe_window_is_stable(spec, resolved_end):
+            return self._timeframe_cache_stable_ttl_seconds
+        return self._timeframe_cache_recent_ttl_seconds
+
+    def _get_cached_timeframe_result(
+        self,
+        key: _TimeframeCacheKey,
+        *,
+        started_at: float,
+    ) -> TimeframeCandleResult | None:
+        if self._timeframe_cache_max_entries < 1:
+            return None
+
+        now = monotonic()
+        with self._timeframe_cache_lock:
+            entry = self._timeframe_cache.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at_monotonic <= now:
+                self._timeframe_cache.pop(key, None)
+                return None
+            self._timeframe_cache.move_to_end(key)
+
+        return self._clone_timeframe_result(
+            entry.result,
+            latency_secs=round(max(perf_counter() - started_at, 0.0), 6),
+        )
+
+    def _matching_cached_timeframe_results(
+        self,
+        *,
+        symbol: str,
+        spec: TimeframeSpec,
+        resolved_end: datetime,
+    ) -> list[tuple[_TimeframeCacheKey, _TimeframeCacheEntry]]:
+        if self._timeframe_cache_max_entries < 1:
+            return []
+
+        now = monotonic()
+        matches: list[tuple[_TimeframeCacheKey, _TimeframeCacheEntry]] = []
+        expired_keys: list[_TimeframeCacheKey] = []
+        with self._timeframe_cache_lock:
+            for key, entry in list(self._timeframe_cache.items()):
+                if entry.expires_at_monotonic <= now:
+                    expired_keys.append(key)
+                    continue
+                if key.symbol == symbol and key.timeframe == spec.api_name and key.end_time == resolved_end:
+                    matches.append((key, entry))
+                    self._timeframe_cache.move_to_end(key)
+            for expired_key in expired_keys:
+                self._timeframe_cache.pop(expired_key, None)
+        return matches
+
+    def _get_cached_superset_timeframe_result(
+        self,
+        *,
+        symbol: str,
+        spec: TimeframeSpec,
+        limit: int,
+        resolved_end: datetime,
+        started_at: float,
+    ) -> TimeframeCandleResult | None:
+        candidates = [
+            (key, entry)
+            for key, entry in self._matching_cached_timeframe_results(
+                symbol=symbol,
+                spec=spec,
+                resolved_end=resolved_end,
+            )
+            if key.limit >= limit
+        ]
+        if not candidates:
+            return None
+
+        best_key, best_entry = min(candidates, key=lambda item: item[0].limit)
+        record_binance_cache_event("timeframe_cache_hit_superset")
+        metadata = dict(best_entry.result.metadata)
+        notes = metadata.get("notes")
+        if isinstance(notes, list):
+            metadata["notes"] = _clean_metadata_notes([*notes, "served_from_timeframe_cache_superset"])
+        metadata["latency_secs"] = round(max(perf_counter() - started_at, 0.0), 6)
+        return TimeframeCandleResult(
+            frame=best_entry.result.frame.sort("timestamp").tail(limit).clone(),
+            metadata=metadata,
+        )
+
+    def _get_cached_partial_timeframe_result(
+        self,
+        *,
+        symbol: str,
+        spec: TimeframeSpec,
+        limit: int,
+        resolved_end: datetime,
+        started_at: float,
+    ) -> TimeframeCandleResult | None:
+        candidates = [
+            (key, entry)
+            for key, entry in self._matching_cached_timeframe_results(
+                symbol=symbol,
+                spec=spec,
+                resolved_end=resolved_end,
+            )
+            if key.limit < limit and entry.result.frame.height > 0
+        ]
+        if not candidates:
+            return None
+
+        best_key, best_entry = max(candidates, key=lambda item: item[0].limit)
+        record_binance_cache_event("timeframe_cache_hit_partial")
+        metadata = dict(best_entry.result.metadata)
+        metadata["latency_secs"] = round(max(perf_counter() - started_at, 0.0), 6)
+        return TimeframeCandleResult(
+            frame=best_entry.result.frame.sort("timestamp").tail(best_key.limit).clone(),
+            metadata=metadata,
+        )
+
+    def _store_cached_timeframe_result(
+        self,
+        key: _TimeframeCacheKey,
+        *,
+        spec: TimeframeSpec,
+        resolved_end: datetime,
+        result: TimeframeCandleResult,
+    ) -> None:
+        if self._timeframe_cache_max_entries < 1:
+            return
+
+        ttl_seconds = self._timeframe_cache_ttl_seconds(spec, resolved_end)
+        if ttl_seconds < 1:
+            return
+
+        expires_at = monotonic() + ttl_seconds
+        with self._timeframe_cache_lock:
+            self._timeframe_cache[key] = _TimeframeCacheEntry(result=result, expires_at_monotonic=expires_at)
+            self._timeframe_cache.move_to_end(key)
+
+            now = monotonic()
+            expired_keys = [
+                cache_key
+                for cache_key, cache_entry in self._timeframe_cache.items()
+                if cache_entry.expires_at_monotonic <= now
+            ]
+            for expired_key in expired_keys:
+                self._timeframe_cache.pop(expired_key, None)
+
+            while len(self._timeframe_cache) > self._timeframe_cache_max_entries:
+                self._timeframe_cache.popitem(last=False)
 
     def _btc_local_complexity_notes(self, spec: TimeframeSpec, limit: int) -> list[str]:
         if not self._enable_btc_complexity_guard:
@@ -285,6 +503,8 @@ class LiveDataApiService:
             raise ValueError("end_time must be on or after start_time")
 
         symbol = normalize_symbol(coin)
+        if self._is_local_only_btc_symbol(symbol):
+            allow_binance_patch = False
         expected_rows = expected_minute_count(window_start, resolved_end)
 
         local_frame = self._repository.load_canonical_minutes(symbol, window_start, resolved_end)
@@ -292,7 +512,7 @@ class LiveDataApiService:
         source = "local"
 
         # Prefer the shared minute-lake live store for its configured symbol.
-        # Other symbols continue to warm up through the API process WS manager.
+        # Other symbols only reuse an existing API-process WS collector.
         live_collector = self._resolve_live_collector(symbol)
 
         local_can_serve = (
@@ -314,7 +534,7 @@ class LiveDataApiService:
             else:
                 combined_frame = remote_frame
                 source = "binance"
-        elif local_frame.height == 0 and expected_rows > self._on_demand_max_minutes:
+        elif allow_binance_patch and local_frame.height == 0 and expected_rows > self._on_demand_max_minutes:
             raise ValueError(
                 "Requested window is not available locally and is too large for on-demand Binance retrieval. "
                 "Reduce limit or materialize the symbol into the minute lake first."
@@ -342,6 +562,23 @@ class LiveDataApiService:
             source=source,
             frame=cast_canonical_frame(combined_frame),
             live_overlay_used=live_overlay_used,
+        )
+
+    def load_local_higher_timeframe_window(
+        self,
+        *,
+        coin: str,
+        timeframe: str,
+        start_time: datetime,
+        end_time: str | datetime | None = None,
+    ) -> pl.DataFrame:
+        if self._higher_timeframe_repository is None:
+            return empty_canonical_frame()
+        return self._higher_timeframe_repository.load_candle_bars(
+            symbol=normalize_symbol(coin),
+            timeframe=timeframe,
+            start_time=floor_utc_minute(start_time),
+            end_time=self.resolve_end_time(coin=coin, end_time=end_time),
         )
 
     @staticmethod
@@ -868,6 +1105,143 @@ class LiveDataApiService:
             },
         ), []
 
+    @staticmethod
+    def _best_partial_local_frame(primary: pl.DataFrame, secondary: pl.DataFrame, *, limit: int) -> pl.DataFrame:
+        if primary.height >= secondary.height:
+            return primary.tail(limit)
+        return secondary.tail(limit)
+
+    def _btc_local_only_result(
+        self,
+        *,
+        frame: pl.DataFrame,
+        source: str,
+        source_strategy: str,
+        fetch_mode: str,
+        notes: list[str],
+        started_at: float,
+        live_overlay_used: bool = False,
+    ) -> TimeframeCandleResult:
+        return TimeframeCandleResult(
+            frame=self._add_native_derived_fields(frame),
+            metadata={
+                "source": source,
+                "source_strategy": source_strategy,
+                "fetch_mode": fetch_mode,
+                "fallback_used": False,
+                "local_minute_lake_used": source_strategy == "local_minute_lake_preferred",
+                "local_higher_timeframe_lake_used": source_strategy == "local_higher_timeframe_lake",
+                "live_ws_overlay_used": live_overlay_used,
+                "binance_interval": None,
+                "notes": _clean_metadata_notes(notes),
+                "latency_secs": round(max(perf_counter() - started_at, 0.0), 6),
+            },
+        )
+
+    def _load_btc_local_only_bars(
+        self,
+        *,
+        coin: str,
+        spec: TimeframeSpec,
+        limit: int,
+        resolved_end: datetime,
+        started_at: float,
+    ) -> TimeframeCandleResult:
+        start_time = requested_window_start(
+            resolved_end,
+            specs=[spec],
+            timeframe_limits={spec.api_name: limit},
+        )
+        higher_tf_notes: list[str] = []
+        higher_tf_frame = empty_canonical_frame()
+
+        if spec.minutes > 3:
+            higher_tf_frame = self.load_local_higher_timeframe_window(
+                coin=coin,
+                timeframe=spec.api_name,
+                start_time=start_time,
+                end_time=resolved_end,
+            ).tail(limit)
+            if higher_tf_frame.height >= limit:
+                return self._btc_local_only_result(
+                    frame=higher_tf_frame,
+                    source="local",
+                    source_strategy="local_higher_timeframe_lake",
+                    fetch_mode="direct_local_higher_tf",
+                    notes=["using_local_btc_higher_timeframe_lake"],
+                    started_at=started_at,
+                )
+            if higher_tf_frame.height > 0:
+                higher_tf_notes.extend(
+                    [
+                        "btc_higher_tf_local_lake_partial_window",
+                        "btc_higher_tf_local_minute_aggregation_fallback",
+                    ]
+                )
+            else:
+                higher_tf_notes.extend(
+                    [
+                        "btc_higher_tf_local_lake_missing_required_window",
+                        "btc_higher_tf_local_minute_aggregation_fallback",
+                    ]
+                )
+
+        def local_can_serve(local_frame: pl.DataFrame) -> bool:
+            return aggregate_canonical_frame(local_frame, spec, limit=limit).height >= limit
+
+        window = self.load_canonical_window(
+            coin=coin,
+            start_time=start_time,
+            end_time=resolved_end,
+            local_can_serve_predicate=local_can_serve,
+            allow_binance_patch=False,
+        )
+        aggregate = aggregate_canonical_frame(window.frame, spec, limit=limit)
+        if aggregate.height >= limit:
+            notes = list(higher_tf_notes)
+            notes.append("using_local_btc_minute_lake")
+            notes.append("btc_local_path_selected")
+            if window.live_overlay_used:
+                notes.append("using_live_ws_overlay")
+            else:
+                notes.append("local_btc_stale_live_overlay_unavailable")
+            return self._btc_local_only_result(
+                frame=aggregate,
+                source=window.source,
+                source_strategy="local_minute_lake_preferred",
+                fetch_mode="aggregate_from_1m",
+                notes=notes,
+                started_at=started_at,
+                live_overlay_used=window.live_overlay_used,
+            )
+
+        partial_frame = self._best_partial_local_frame(aggregate, higher_tf_frame, limit=limit)
+        notes = list(higher_tf_notes)
+        if aggregate.height > 0:
+            notes.append("using_local_btc_minute_lake")
+        notes.extend(
+            [
+                "local_btc_missing_required_window",
+                "btc_local_only_no_binance_fallback",
+            ]
+        )
+        fetch_mode = "aggregate_from_1m" if aggregate.height >= higher_tf_frame.height else "direct_local_higher_tf"
+        source_strategy = (
+            "local_minute_lake_preferred"
+            if aggregate.height >= higher_tf_frame.height
+            else "local_higher_timeframe_lake"
+        )
+        source = "local" if partial_frame.height > 0 else "local_unavailable"
+        return self._btc_local_only_result(
+            frame=partial_frame,
+            source=source,
+            source_strategy=source_strategy,
+            fetch_mode=fetch_mode if partial_frame.height > 0 else "local_only_unavailable",
+            notes=notes,
+            started_at=started_at,
+            live_overlay_used=window.live_overlay_used if aggregate.height >= higher_tf_frame.height else False,
+        )
+
     def load_candle_bars(
         self,
         *,
@@ -878,8 +1252,17 @@ class LiveDataApiService:
     ) -> TimeframeCandleResult:
         resolved_end = self.resolve_end_time(coin=coin, end_time=end_time)
         symbol = normalize_symbol(coin)
-        decision = plan_timeframe_fetch(spec, self._fetch_planner_config)
         started_at = perf_counter()
+        if self._is_local_only_btc_symbol(symbol):
+            return self._load_btc_local_only_bars(
+                coin=coin,
+                spec=spec,
+                limit=limit,
+                resolved_end=resolved_end,
+                started_at=started_at,
+            )
+
+        decision = plan_timeframe_fetch(spec, self._fetch_planner_config)
         notes = list(decision.notes)
 
         local_result, local_fallback_notes = self._try_load_local_preferred_bars(
@@ -903,6 +1286,87 @@ class LiveDataApiService:
                     specs=[spec],
                     timeframe_limits={spec.api_name: limit},
                 )
+                cache_key = self._timeframe_cache_key(
+                    symbol=symbol,
+                    spec=spec,
+                    limit=limit,
+                    resolved_end=resolved_end,
+                )
+                cached_result = self._get_cached_timeframe_result(cache_key, started_at=started_at)
+                if cached_result is not None:
+                    record_binance_cache_event("timeframe_cache_hit_exact")
+                    return cached_result
+                cached_superset = self._get_cached_superset_timeframe_result(
+                    symbol=symbol,
+                    spec=spec,
+                    limit=limit,
+                    resolved_end=resolved_end,
+                    started_at=started_at,
+                )
+                if cached_superset is not None:
+                    self._store_cached_timeframe_result(
+                        cache_key,
+                        spec=spec,
+                        resolved_end=resolved_end,
+                        result=cached_superset,
+                    )
+                    return cached_superset
+                cached_partial = self._get_cached_partial_timeframe_result(
+                    symbol=symbol,
+                    spec=spec,
+                    limit=limit,
+                    resolved_end=resolved_end,
+                    started_at=started_at,
+                )
+                if cached_partial is not None and cached_partial.frame.height < limit:
+                    earliest_timestamp = cached_partial.frame.get_column("timestamp").min()
+                    if isinstance(earliest_timestamp, datetime):
+                        missing_limit = limit - cached_partial.frame.height
+                        missing_result = self.load_candle_bars(
+                            coin=coin,
+                            spec=spec,
+                            limit=missing_limit,
+                            end_time=earliest_timestamp - timedelta(minutes=1),
+                        )
+                        combined = (
+                            pl.concat([missing_result.frame, cached_partial.frame], how="vertical_relaxed")
+                            .sort("timestamp")
+                            .unique(subset=["timestamp"], keep="last", maintain_order=True)
+                            .tail(limit)
+                        )
+                        partial_notes = cached_partial.metadata.get("notes")
+                        missing_notes = missing_result.metadata.get("notes")
+                        result = TimeframeCandleResult(
+                            frame=combined.clone(),
+                            metadata={
+                                **dict(cached_partial.metadata),
+                                "source": (
+                                    cached_partial.metadata.get("source")
+                                    if cached_partial.metadata.get("source") == missing_result.metadata.get("source")
+                                    else "mixed"
+                                ),
+                                "fallback_used": bool(
+                                    cached_partial.metadata.get("fallback_used")
+                                    or missing_result.metadata.get("fallback_used")
+                                ),
+                                "notes": _clean_metadata_notes(
+                                    [
+                                        *(missing_notes if isinstance(missing_notes, list) else []),
+                                        *(partial_notes if isinstance(partial_notes, list) else []),
+                                        "timeframe_cache_extended_from_partial_window",
+                                    ]
+                                ),
+                                "latency_secs": round(max(perf_counter() - started_at, 0.0), 6),
+                            },
+                        )
+                        self._store_cached_timeframe_result(
+                            cache_key,
+                            spec=spec,
+                            resolved_end=resolved_end,
+                            result=result,
+                        )
+                        record_binance_cache_event("timeframe_cache_extended_from_partial_window")
+                        return result
                 rows = fetch_native(
                     symbol,
                     start_time,
@@ -932,7 +1396,7 @@ class LiveDataApiService:
                         "latency_secs": elapsed,
                     },
                 )
-                return TimeframeCandleResult(
+                result = TimeframeCandleResult(
                     frame=frame,
                     metadata={
                         "source": decision.candle_source,
@@ -943,6 +1407,13 @@ class LiveDataApiService:
                         "latency_secs": elapsed,
                     },
                 )
+                self._store_cached_timeframe_result(
+                    cache_key,
+                    spec=spec,
+                    resolved_end=resolved_end,
+                    result=result,
+                )
+                return result
             notes.append("native_candle_provider_method_unavailable")
 
         if self._fetch_planner_config.allow_legacy_1m_fallback:
@@ -1059,7 +1530,8 @@ class LiveDataApiService:
 
         if len(timeframe_requests) > 1:
             with ThreadPoolExecutor(max_workers=len(timeframe_requests)) as executor:
-                fetched = dict(executor.map(_aggregate_one, timeframe_requests))
+                futures = [executor.submit(copy_context().run, _aggregate_one, request) for request in timeframe_requests]
+                fetched = dict(future.result() for future in futures)
         else:
             fetched = dict(map(_aggregate_one, timeframe_requests))
         payload = {name: rows for name, (rows, _) in fetched.items()}

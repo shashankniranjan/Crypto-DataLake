@@ -17,6 +17,9 @@ class ApiServiceSettings(BaseSettings):
     on_demand_max_minutes: int = Field(default=60_480, ge=60)
     ws_idle_timeout_seconds: int = Field(default=3600, ge=30)
     ws_max_subscriptions: int = Field(default=50, ge=1)
+    # When false, the API service will reuse already-running WS collectors but
+    # will not start or pre-warm subscriptions on its own.
+    enable_ws_warmup: bool = Field(default=False)
     # Comma-separated symbols to subscribe on startup, e.g. "BTC,ETH,GIGGLE"
     # Each value is normalised to USDT perp format before subscribing.
     ws_symbols: str = Field(default="")

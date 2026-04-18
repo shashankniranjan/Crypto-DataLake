@@ -40,7 +40,7 @@ bml = "binance_minute_lake.cli.app:app"
 live-data-api = "live_data_api_service.app:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/binance_minute_lake", "src/live_data_api_service", "src/live_indicators"]
+packages = ["src/aggregator", "src/binance_minute_lake", "src/live_data_api_service", "src/live_indicators"]
 
 [tool.pytest.ini_options]
 addopts = "-q --cov=src/binance_minute_lake --cov-report=term-missing"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -422,7 +423,7 @@ class ParallelLiveBinanceProvider:
 
         raw: dict[str, object] = {}
         with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-            futures = {name: executor.submit(fn) for name, fn in tasks.items()}
+            futures = {name: executor.submit(copy_context().run, fn) for name, fn in tasks.items()}
             for name, future in futures.items():
                 try:
                     raw[name] = future.result()

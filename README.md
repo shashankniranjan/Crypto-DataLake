@@ -208,7 +208,7 @@ PYTHONPATH=src bml run-forever  # poll every minute indefinitely (with rate limi
 3. Use `poetry shell` or `source .venv/bin/activate` before running `bml` commands.
 4. Validate `state/` and `logs/` directories are writable by the service account that will run the CLI.
 5. Optional retention tuning:
-   - `BML_LIVE_EVENT_RETENTION_HOURS` (default `72`)
+   - `BML_LIVE_EVENT_RETENTION_HOURS` (default `12`)
    - `BML_LIVE_HEARTBEAT_RETENTION_DAYS` (default `14`)
    - `BML_LIVE_CLEANUP_INTERVAL_MINUTES` (default `30`)
    - `BML_LIVE_CLEANUP_VACUUM_INTERVAL_HOURS` (default `24`)
@@ -218,6 +218,82 @@ PYTHONPATH=src bml run-forever  # poll every minute indefinitely (with rate limi
 - `bml run-once` – executes a single minute job, writing parquet and booking ledger entries.
 - `bml run-daemon --poll-seconds 60` – loops the minute job with configurable polling; use a process manager (systemd, supervisord) in prod.
 - `PYTHONPATH=src bml run-forever` – alignment-aware infinite poller (adds rate limiting).
+
+## Higher-timeframe aggregator
+
+The repo now includes a separate local HTF materialization service under [src/aggregator](/Users/shashankniranjan/IdeaProjects/Crypto-Data-Scheduler/src/aggregator) plus shell scripts at [scripts/run-aggregator.sh](/Users/shashankniranjan/IdeaProjects/Crypto-Data-Scheduler/scripts/run-aggregator.sh) and [scripts/stop-aggregator.sh](/Users/shashankniranjan/IdeaProjects/Crypto-Data-Scheduler/scripts/stop-aggregator.sh).
+
+This service keeps the existing minute lake strictly read-only. It only reads from:
+
+- [data/futures/um/minute](/Users/shashankniranjan/IdeaProjects/Crypto-Data-Scheduler/data/futures/um/minute)
+
+And writes its own higher-timeframe outputs to a separate tree:
+
+- [data/futures/um/higher_timeframes](/Users/shashankniranjan/IdeaProjects/Crypto-Data-Scheduler/data/futures/um/higher_timeframes)
+
+State and checkpoints are stored separately in:
+
+- [state/aggregator_state.sqlite](/Users/shashankniranjan/IdeaProjects/Crypto-Data-Scheduler/state/aggregator_state.sqlite)
+
+### Behavior
+
+- Startup runs backfill first, detects missing complete HTF buckets from minute history, writes only those buckets, then enters continuous polling mode.
+- Continuous mode only recomputes newly completable buckets plus a recent repair lookback window so late minute arrivals or duplicate-minute corrections can rewrite recent HTF buckets idempotently.
+- Incomplete buckets are skipped by default and are only materialized when `HTF_ALLOW_INCOMPLETE_BUCKETS=true`.
+- Weekly buckets are aligned to Monday `00:00 UTC`; monthly buckets are aligned to the first day of month `00:00 UTC`.
+
+### Usage
+
+```bash
+./scripts/run-aggregator.sh
+```
+
+The default background start command now streams the aggregator log to your console. Press `Ctrl+C` to detach from the log stream without stopping the service.
+
+Bounded validation runs:
+
+```bash
+HTF_TIMEFRAMES=5m ./scripts/run-aggregator.sh --once
+HTF_TIMEFRAMES=5m ./scripts/run-aggregator.sh --startup-only
+./scripts/stop-aggregator.sh
+```
+
+Optional environment variables:
+
+- `HTF_SYMBOL=BTCUSDT`
+- `HTF_SOURCE_ROOT=./data`
+- `HTF_TARGET_ROOT=./data/futures/um/higher_timeframes`
+- `HTF_STATE_DB=./state/aggregator_state.sqlite`
+- `HTF_POLL_INTERVAL_SECONDS=30`
+- `HTF_REPAIR_LOOKBACK_MINUTES=120`
+- `HTF_ALLOW_INCOMPLETE_BUCKETS=false`
+- `HTF_TIMEFRAMES=3m,5m,10m,15m,30m,45m,1h,4h,8h,1d,1w,1M`
+- `TAIL_LINES=20`
+
+### Aggregation rule table
+
+The rule mapping used by the service is implemented in [src/aggregator/aggregation_rules.py](/Users/shashankniranjan/IdeaProjects/Crypto-Data-Scheduler/src/aggregator/aggregation_rules.py). Summary:
+
+| Column | Rule |
+| --- | --- |
+| `open`, `high`, `low`, `close` | TradingView-style OHLC from minute rows |
+| `volume_btc`, `volume_usdt`, `trade_count` | Sum |
+| `vwap` | `sum(volume_usdt) / sum(volume_btc)` |
+| `avg_trade_size_btc` | `sum(volume_btc) / sum(trade_count)` |
+| `max_trade_size_btc` | Max |
+| `taker_*`, whale/retail flow, liquidation notionals/counts | Sum |
+| `liq_avg_fill_price`, `liq_unfilled_ratio` | Weighted average by minute liquidation notional |
+| `oi_*`, funding/ratio snapshots, `micro_price_close` | Last non-null in bucket |
+| `mark_price_open`, `index_price_open` | First non-null in bucket |
+| `mark_price_close`, `index_price_close` | Last non-null in bucket |
+| `avg_spread_usdt`, `bid_ask_imbalance`, `avg_bid_depth`, `avg_ask_depth`, `spread_pct`, `price_impact_100k` | Volume-weighted average using `volume_usdt`, fallback simple mean |
+| `has_depth`, `impact_fillable`, `depth_degraded`, `has_ws_latency`, `ws_latency_bad`, `has_ls_ratio`, `has_liq`, `liq_unfilled_supported` | Boolean OR |
+| `realized_vol_htf` | Recomputed from minute close-to-close log returns inside the HTF bucket |
+| `event_time`, `transact_time`, `arrival_time` | Max |
+| `update_id_start`, `update_id_end` | Min non-null / max non-null |
+| `timeframe`, `symbol`, `bucket_start`, `bucket_end`, `expected_minutes_in_bucket`, `observed_minutes_in_bucket`, `missing_minutes_count`, `bucket_complete` | HTF metadata and quality columns |
+
+For derivatives fields where vendor internals are not public, the implementation uses defensible industry-standard approximations and documents them inline. The minute parquet files, partition layout, schema, and generation logic remain untouched.
 - `PYTHONPATH=src bml run-live-forever` – live daemon; includes automatic retention cleanup for `state/live_events.sqlite`.
 - `PYTHONPATH=src bml cleanup-live-state` – one-off retention cleanup and optional SQLite `VACUUM`.
 - `bml show-watermark` – displays the most recent timestamp and ledger position per symbol.

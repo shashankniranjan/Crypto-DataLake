@@ -16,7 +16,7 @@ from live_data_api_service.alignment import AlignmentMode, align_series, normali
 from live_data_api_service.app import create_app
 from live_data_api_service.binance_provider import BinanceCanonicalMinuteProvider
 from live_data_api_service.capabilities import CandleFetchMode, FetchPlannerConfig, plan_timeframe_fetch
-from live_data_api_service.repository import MinuteLakeRepository
+from live_data_api_service.repository import HigherTimeframeRepository, MinuteLakeRepository
 from live_data_api_service.service import LiveDataApiService
 from live_data_api_service.timeframes import parse_timeframe_requests, parse_timeframes
 from live_data_api_service.utils import cast_canonical_frame, serialize_frame
@@ -37,6 +37,26 @@ def _write_partition(root_dir: Path, symbol: str, hour_start: datetime, frame: p
         / f"month={hour_start:%m}"
         / f"day={hour_start:%d}"
         / f"hour={hour_start:%H}"
+        / "part.parquet"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frame.write_parquet(target)
+
+
+def _write_higher_timeframe_partition(
+    root_dir: Path,
+    timeframe: str,
+    symbol: str,
+    day_start: datetime,
+    frame: pl.DataFrame,
+) -> None:
+    target = (
+        root_dir
+        / "timeframe={timeframe}".format(timeframe=timeframe)
+        / f"symbol={symbol}"
+        / f"year={day_start:%Y}"
+        / f"month={day_start:%m}"
+        / f"day={day_start:%d}"
         / "part.parquet"
     )
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -320,45 +340,21 @@ def test_service_merges_local_rows_over_provider_rows(tmp_path: Path) -> None:
     local_frame = _canonical_frame(local_rows)
     _write_partition(tmp_path, symbol, start.replace(minute=0), local_frame)
 
-    class FakeProvider:
+    class GuardProvider:
         def build_canonical_minutes(
             self,
             requested_symbol: str,
             start_time: datetime,
             end_time: datetime,
         ) -> pl.DataFrame:
-            assert requested_symbol == symbol
-            remote_rows = []
-            cursor = start_time
-            while cursor <= end_time:
-                remote_rows.append(
-                    {
-                        "timestamp": cursor,
-                        "open": 100.0,
-                        "high": 101.0,
-                        "low": 99.0,
-                        "close": 100.5,
-                        "volume_btc": 1.0,
-                        "volume_usdt": 1000.0,
-                        "trade_count": 10,
-                        "taker_buy_vol_btc": 0.5,
-                        "taker_buy_vol_usdt": 500.0,
-                        "has_depth": False,
-                        "mark_price_open": 100.0,
-                        "mark_price_close": 100.0,
-                        "index_price_open": 100.0,
-                        "index_price_close": 100.0,
-                    }
-                )
-                cursor += timedelta(minutes=1)
-            return _canonical_frame(remote_rows)
+            raise AssertionError("BTC should not merge missing minutes from Binance")
 
         def close(self) -> None:
             return None
 
     service = LiveDataApiService(
         repository=MinuteLakeRepository(tmp_path),
-        provider=FakeProvider(),
+        provider=GuardProvider(),
         default_limit=3,
         max_limit=10,
         on_demand_max_minutes=60,
@@ -371,8 +367,8 @@ def test_service_merges_local_rows_over_provider_rows(tmp_path: Path) -> None:
         end_time="2026-01-15T10:01:00Z",
     )
 
-    assert payload["source"] == "local+binance"
-    assert len(payload["data"]["1m"]) == 2
+    assert payload["source"] == "local"
+    assert len(payload["data"]["1m"]) == 1
     local_row = payload["data"]["1m"][0]
     assert local_row["timestamp"] == "2026-01-15T10:00:00.000Z"
     assert local_row["has_depth"] is True
@@ -560,15 +556,16 @@ def test_service_defaults_to_recent_local_watermark_when_end_time_is_omitted(tmp
     assert payload["data"]["1m"][-1]["timestamp"] == "2026-01-15T10:04:00.000Z"
 
 
-def test_service_warms_non_shared_symbol_on_first_request_and_returns_live_data_on_next_query(tmp_path: Path) -> None:
+def test_service_does_not_warm_non_shared_symbol_and_reuses_existing_collector(tmp_path: Path) -> None:
     touched_symbols: list[str] = []
     provider_live_collectors: list[object | None] = []
     collector = InMemoryLiveCollector(symbol="ETHUSDT")
+    collector_available = False
 
     class RecordingWsManager:
         def get_collector(self, requested_symbol: str) -> InMemoryLiveCollector | None:
             assert requested_symbol == "ETHUSDT"
-            return collector if touched_symbols else None
+            return collector if collector_available else None
 
         def touch(self, requested_symbol: str) -> InMemoryLiveCollector:
             touched_symbols.append(requested_symbol)
@@ -631,13 +628,14 @@ def test_service_warms_non_shared_symbol_on_first_request_and_returns_live_data_
     )
 
     assert payload_first["source"] == "binance"
-    assert touched_symbols == ["ETHUSDT"]
+    assert touched_symbols == []
     assert provider_live_collectors == [None]
     first_row = payload_first["data"]["1m"][1]
     assert first_row["has_depth"] is False
     assert first_row["has_liq"] is False
     assert first_row["liq_long_vol_usdt"] is None
 
+    collector_available = True
     live_minute_ms = int(datetime(2026, 1, 15, 10, 1, tzinfo=UTC).timestamp() * 1000)
     collector.set_depth_snapshot(
         symbol="ETHUSDT",
@@ -678,7 +676,7 @@ def test_service_warms_non_shared_symbol_on_first_request_and_returns_live_data_
     )
 
     assert payload_second["source"] == "binance"
-    assert touched_symbols == ["ETHUSDT", "ETHUSDT"]
+    assert touched_symbols == ["ETHUSDT"]
     assert provider_live_collectors == [None, collector]
     second_row = payload_second["data"]["1m"][1]
     assert second_row["has_depth"] is True
@@ -688,6 +686,31 @@ def test_service_warms_non_shared_symbol_on_first_request_and_returns_live_data_
     assert second_row["liq_short_count"] == 1
     assert second_row["liq_unfilled_supported"] is True
     assert second_row["liq_unfilled_ratio"] == 0.25
+
+
+def test_app_does_not_prewarm_ws_symbols_when_warmup_disabled() -> None:
+    touched_symbols: list[str] = []
+
+    class RecordingWsManager:
+        def touch(self, requested_symbol: str) -> object:
+            touched_symbols.append(requested_symbol)
+            return object()
+
+        def stop(self) -> None:
+            return None
+
+    class FakeService:
+        def __init__(self) -> None:
+            self._ws_manager = RecordingWsManager()
+
+        def close(self) -> None:
+            return None
+
+    with patch.dict("os.environ", {"BML_API_WS_SYMBOLS": "BTC,ETH"}, clear=False):
+        with TestClient(create_app(FakeService())):
+            pass
+
+    assert touched_symbols == []
 
 
 def test_api_endpoint_returns_requested_timeframes_from_local_store(tmp_path: Path) -> None:
@@ -1146,6 +1169,132 @@ def test_api_endpoint_fetches_native_binance_timeframes_when_available(tmp_path:
     assert len(payload["data"]["1hr"]) == 2
 
 
+def test_api_endpoint_reuses_cached_native_candle_response_for_same_request(tmp_path: Path) -> None:
+    native_calls: list[tuple[str, str, int]] = []
+
+    class CountingNativeProvider:
+        def fetch_native_candles(
+            self,
+            symbol: str,
+            start_time: datetime,
+            end_time: datetime,
+            *,
+            interval: str,
+            limit: int,
+        ) -> list[dict[str, object]]:
+            native_calls.append((symbol, interval, limit))
+            base = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
+            return [
+                {
+                    "open_time": int((base + timedelta(minutes=5 * idx)).timestamp() * 1000),
+                    "open": 100.0 + idx,
+                    "high": 101.0 + idx,
+                    "low": 99.0 + idx,
+                    "close": 100.5 + idx,
+                    "volume_btc": 10.0,
+                    "close_time": int((base + timedelta(minutes=5 * idx + 5)).timestamp() * 1000),
+                    "volume_usdt": 1000.0,
+                    "trade_count": 20,
+                    "taker_buy_vol_btc": 6.0,
+                    "taker_buy_vol_usdt": 600.0,
+                }
+                for idx in range(limit)
+            ]
+
+        def close(self) -> None:
+            return None
+
+    service = LiveDataApiService(
+        repository=MinuteLakeRepository(tmp_path),
+        provider=CountingNativeProvider(),
+        default_limit=20,
+        max_limit=500,
+        on_demand_max_minutes=60_480,
+    )
+    client = TestClient(create_app(service))
+
+    params = {"coin": "ETH", "tfs": "5m=2", "end_time": "2026-01-15T10:09:00Z"}
+    first = client.get("/api/v1/perpetual-data", params=params)
+    second = client.get("/api/v1/perpetual-data", params=params)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert native_calls == [("ETHUSDT", "5m", 2)]
+    assert first.json()["data"]["5m"] == second.json()["data"]["5m"]
+    assert first.json()["timeframe_metadata"]["5m"]["fetch_mode"] == "direct_tf"
+    assert second.json()["timeframe_metadata"]["5m"]["fetch_mode"] == "direct_tf"
+
+
+def test_service_extends_cached_native_candle_window_with_only_missing_bars(tmp_path: Path) -> None:
+    native_calls: list[tuple[str, str, int, datetime]] = []
+
+    class CountingNativeProvider:
+        def fetch_native_candles(
+            self,
+            symbol: str,
+            start_time: datetime,
+            end_time: datetime,
+            *,
+            interval: str,
+            limit: int,
+        ) -> list[dict[str, object]]:
+            native_calls.append((symbol, interval, limit, end_time))
+            step = 5
+            base = datetime(2026, 1, 15, 9, 40, tzinfo=UTC)
+            bars = []
+            cursor = base
+            while cursor <= end_time and len(bars) < 32:
+                bars.append(
+                    {
+                        "open_time": int(cursor.timestamp() * 1000),
+                        "open": 100.0 + len(bars),
+                        "high": 101.0 + len(bars),
+                        "low": 99.0 + len(bars),
+                        "close": 100.5 + len(bars),
+                        "volume_btc": 10.0,
+                        "close_time": int((cursor + timedelta(minutes=step)).timestamp() * 1000),
+                        "volume_usdt": 1000.0,
+                        "trade_count": 20,
+                        "taker_buy_vol_btc": 6.0,
+                        "taker_buy_vol_usdt": 600.0,
+                    }
+                )
+                cursor += timedelta(minutes=step)
+            return bars[-limit:]
+
+        def close(self) -> None:
+            return None
+
+    service = LiveDataApiService(
+        repository=MinuteLakeRepository(tmp_path),
+        provider=CountingNativeProvider(),
+        default_limit=20,
+        max_limit=500,
+        on_demand_max_minutes=60_480,
+    )
+
+    spec = parse_timeframe_requests("5m")[0].spec
+    first = service.load_candle_bars(
+        coin="ETH",
+        spec=spec,
+        limit=2,
+        end_time=datetime(2026, 1, 15, 10, 9, tzinfo=UTC),
+    )
+    second = service.load_candle_bars(
+        coin="ETH",
+        spec=spec,
+        limit=5,
+        end_time=datetime(2026, 1, 15, 10, 9, tzinfo=UTC),
+    )
+
+    assert first.frame.height == 2
+    assert second.frame.height == 5
+    assert [call[:3] for call in native_calls] == [
+        ("ETHUSDT", "5m", 2),
+        ("ETHUSDT", "5m", 3),
+    ]
+
+
 def test_btc_prefers_local_minute_lake_when_coverage_exists(tmp_path: Path) -> None:
     symbol = "BTCUSDT"
     start = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
@@ -1206,47 +1355,20 @@ def test_btc_prefers_local_minute_lake_when_coverage_exists(tmp_path: Path) -> N
     assert payload["data"]["5m"][0]["update_id_start"] == 10
 
 
-def test_btc_local_fastpath_falls_back_to_native_when_local_missing(tmp_path: Path) -> None:
-    native_calls: list[tuple[str, str, int]] = []
-
-    class NativeFallbackProvider:
-        def fetch_native_candles(
-            self,
-            symbol: str,
-            start_time: datetime,
-            end_time: datetime,
-            *,
-            interval: str,
-            limit: int,
-        ) -> list[dict[str, object]]:
-            native_calls.append((symbol, interval, limit))
-            base = datetime(2026, 1, 15, 10, 5, tzinfo=UTC)
-            return [
-                {
-                    "open_time": int(base.timestamp() * 1000),
-                    "open": 100.0,
-                    "high": 101.0,
-                    "low": 99.0,
-                    "close": 100.5,
-                    "volume_btc": 10.0,
-                    "close_time": int((base + timedelta(minutes=5)).timestamp() * 1000),
-                    "volume_usdt": 1000.0,
-                    "trade_count": 20,
-                    "taker_buy_vol_btc": 6.0,
-                    "taker_buy_vol_usdt": 600.0,
-                }
-                for _ in range(limit)
-            ]
+def test_btc_local_fastpath_does_not_fall_back_to_binance_when_local_missing(tmp_path: Path) -> None:
+    class GuardProvider:
+        def fetch_native_candles(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+            raise AssertionError("BTC should not fall back to Binance candles")
 
         def build_canonical_minutes(self, *args: object, **kwargs: object) -> pl.DataFrame:
-            raise AssertionError("simulate unavailable BTC local patch path")
+            raise AssertionError("BTC should not patch missing local minutes from Binance")
 
         def close(self) -> None:
             return None
 
     service = LiveDataApiService(
         repository=MinuteLakeRepository(tmp_path),
-        provider=NativeFallbackProvider(),
+        provider=GuardProvider(),
         default_limit=20,
         max_limit=500,
         on_demand_max_minutes=60_480,
@@ -1261,11 +1383,11 @@ def test_btc_local_fastpath_falls_back_to_native_when_local_missing(tmp_path: Pa
     assert response.status_code == 200
     payload = response.json()
     metadata = payload["timeframe_metadata"]["5m"]
-    assert native_calls == [("BTCUSDT", "5m", 1)]
-    assert payload["source"] == "binance_native"
-    assert metadata["fetch_mode"] == "direct_tf"
+    assert payload["source"] == "local_unavailable"
+    assert metadata["fetch_mode"] == "local_only_unavailable"
     assert "local_btc_missing_required_window" in metadata["notes"]
-    assert "local_btc_coverage_incomplete_fallback_to_binance" in metadata["notes"]
+    assert "btc_local_only_no_binance_fallback" in metadata["notes"]
+    assert payload["data"]["5m"] == []
 
 
 def test_btc_higher_timeframe_at_complexity_threshold_stays_local(tmp_path: Path) -> None:
@@ -1321,55 +1443,118 @@ def test_btc_higher_timeframe_at_complexity_threshold_stays_local(tmp_path: Path
     assert "btc_local_path_skipped_due_to_request_complexity" not in metadata["notes"]
 
 
-def test_btc_heavy_higher_timeframe_skips_local_and_uses_native(tmp_path: Path) -> None:
-    native_calls: list[tuple[str, str, int]] = []
+def test_btc_heavy_higher_timeframe_reads_local_higher_timeframe_lake(tmp_path: Path) -> None:
+    higher_tf_root = tmp_path / "futures" / "um" / "higher_timeframes"
+    higher_tf_rows = pl.DataFrame(
+        {
+            "timeframe": ["5m", "5m"],
+            "symbol": ["BTCUSDT", "BTCUSDT"],
+            "timestamp": [
+                datetime(2026, 1, 15, 0, 0, tzinfo=UTC),
+                datetime(2026, 1, 15, 0, 5, tzinfo=UTC),
+            ],
+            "bucket_start": [
+                datetime(2026, 1, 15, 0, 0, tzinfo=UTC),
+                datetime(2026, 1, 15, 0, 5, tzinfo=UTC),
+            ],
+            "bucket_end": [
+                datetime(2026, 1, 15, 0, 5, tzinfo=UTC),
+                datetime(2026, 1, 15, 0, 10, tzinfo=UTC),
+            ],
+            "open": [100.0, 101.0],
+            "high": [101.0, 102.0],
+            "low": [99.0, 100.0],
+            "close": [100.5, 101.5],
+            "volume_btc": [10.0, 11.0],
+            "volume_usdt": [1000.0, 1100.0],
+            "trade_count": [20, 21],
+            "vwap": [100.2, 101.2],
+            "avg_trade_size_btc": [0.5, 0.52],
+            "max_trade_size_btc": [1.0, 1.1],
+            "taker_buy_vol_btc": [6.0, 6.5],
+            "taker_buy_vol_usdt": [600.0, 650.0],
+            "net_taker_vol_btc": [1.0, 1.1],
+            "count_buy_trades": [12, 13],
+            "count_sell_trades": [8, 8],
+            "taker_buy_ratio": [0.6, 0.59],
+            "vol_buy_whale_btc": [0.5, 0.6],
+            "vol_sell_whale_btc": [0.4, 0.5],
+            "vol_buy_retail_btc": [0.3, 0.4],
+            "vol_sell_retail_btc": [0.2, 0.3],
+            "whale_trade_count": [2, 3],
+            "liq_long_vol_usdt": [0.0, 0.0],
+            "liq_short_vol_usdt": [0.0, 0.0],
+            "liq_long_count": [0, 0],
+            "liq_short_count": [0, 0],
+            "liq_avg_fill_price": [None, None],
+            "liq_unfilled_ratio": [None, None],
+            "liq_unfilled_supported": [False, False],
+            "has_liq": [False, False],
+            "oi_contracts": [1000.0, 1001.0],
+            "oi_value_usdt": [1_000_000.0, 1_001_000.0],
+            "top_trader_ls_ratio_acct": [1.1, 1.2],
+            "global_ls_ratio_acct": [0.9, 0.95],
+            "ls_ratio_divergence": [0.2, 0.25],
+            "top_trader_long_pct": [0.55, 0.56],
+            "top_trader_short_pct": [0.45, 0.44],
+            "premium_index": [0.0001, 0.0002],
+            "funding_rate": [0.0003, 0.0004],
+            "predicted_funding": [0.0005, 0.0006],
+            "next_funding_time": [1, 2],
+            "micro_price_close": [100.4, 101.4],
+            "mark_price_open": [100.1, 101.1],
+            "mark_price_close": [100.2, 101.2],
+            "index_price_open": [100.0, 101.0],
+            "index_price_close": [100.0, 101.0],
+            "avg_spread_usdt": [1.0, 1.1],
+            "bid_ask_imbalance": [0.1, 0.2],
+            "avg_bid_depth": [10.0, 11.0],
+            "avg_ask_depth": [12.0, 13.0],
+            "spread_pct": [0.001, 0.0011],
+            "price_impact_100k": [0.002, 0.0021],
+            "has_depth": [True, True],
+            "impact_fillable": [True, True],
+            "depth_degraded": [False, False],
+            "has_ws_latency": [False, False],
+            "ws_latency_bad": [False, False],
+            "has_ls_ratio": [True, True],
+            "realized_vol_htf": [0.01, 0.02],
+            "event_time": [1, 2],
+            "transact_time": [1, 2],
+            "arrival_time": [1, 2],
+            "update_id_start": [10, 20],
+            "update_id_end": [19, 29],
+            "expected_minutes_in_bucket": [5, 5],
+            "observed_minutes_in_bucket": [5, 5],
+            "missing_minutes_count": [0, 0],
+            "bucket_complete": [True, True],
+        }
+    )
+    _write_higher_timeframe_partition(
+        higher_tf_root,
+        "5m",
+        "BTCUSDT",
+        datetime(2026, 1, 15, 0, 0, tzinfo=UTC),
+        higher_tf_rows,
+    )
 
-    class GuardRepository:
-        def load_canonical_minutes(self, *args: object, **kwargs: object) -> pl.DataFrame:
-            raise AssertionError("heavy BTC higher TF should skip local minute-lake loading")
-
-    class NativeProvider:
-        def fetch_native_candles(
-            self,
-            symbol: str,
-            start_time: datetime,
-            end_time: datetime,
-            *,
-            interval: str,
-            limit: int,
-        ) -> list[dict[str, object]]:
-            native_calls.append((symbol, interval, limit))
-            base = datetime(2026, 1, 15, 0, 0, tzinfo=UTC)
-            return [
-                {
-                    "open_time": int((base + timedelta(minutes=5 * idx)).timestamp() * 1000),
-                    "open": 100.0 + idx,
-                    "high": 101.0 + idx,
-                    "low": 99.0 + idx,
-                    "close": 100.5 + idx,
-                    "volume_btc": 10.0,
-                    "close_time": int((base + timedelta(minutes=5 * idx + 5)).timestamp() * 1000),
-                    "volume_usdt": 1000.0,
-                    "trade_count": 20,
-                    "taker_buy_vol_btc": 6.0,
-                    "taker_buy_vol_usdt": 600.0,
-                }
-                for idx in range(limit)
-            ]
+    class GuardProvider:
+        def fetch_native_candles(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+            raise AssertionError("BTC should not use Binance candles for higher timeframes")
 
         def build_canonical_minutes(self, *args: object, **kwargs: object) -> pl.DataFrame:
-            raise AssertionError("heavy BTC higher TF should not use 1m Binance patch path")
+            raise AssertionError("BTC higher timeframe request should not patch from Binance")
 
         def close(self) -> None:
             return None
 
     service = LiveDataApiService(
-        repository=GuardRepository(),  # type: ignore[arg-type]
-        provider=NativeProvider(),
+        repository=MinuteLakeRepository(tmp_path),
+        higher_timeframe_repository=HigherTimeframeRepository(higher_tf_root),
+        provider=GuardProvider(),
         default_limit=20,
         max_limit=500,
         on_demand_max_minutes=60_480,
-        btc_local_max_higher_tf_bars=1,
     )
     client = TestClient(create_app(service))
 
@@ -1381,15 +1566,14 @@ def test_btc_heavy_higher_timeframe_skips_local_and_uses_native(tmp_path: Path) 
     assert response.status_code == 200
     payload = response.json()
     metadata = payload["timeframe_metadata"]["5m"]
-    assert native_calls == [("BTCUSDT", "5m", 2)]
-    assert payload["source"] == "binance_native"
-    assert metadata["fetch_mode"] == "direct_tf"
-    assert "btc_local_path_skipped_due_to_request_complexity" in metadata["notes"]
-    assert "btc_higher_tf_binance_fallback" in metadata["notes"]
-    assert "btc_mixed_source_plan" in metadata["notes"]
+    assert payload["source"] == "local"
+    assert metadata["fetch_mode"] == "direct_local_higher_tf"
+    assert metadata["source_strategy"] == "local_higher_timeframe_lake"
+    assert metadata["local_higher_timeframe_lake_used"] is True
+    assert "using_local_btc_higher_timeframe_lake" in metadata["notes"]
 
 
-def test_btc_mixed_complexity_plan_keeps_1m_local_and_sends_heavy_higher_tf_native(tmp_path: Path) -> None:
+def test_btc_mixed_complexity_plan_keeps_1m_local_and_reads_higher_tf_lake(tmp_path: Path) -> None:
     symbol = "BTCUSDT"
     start = datetime(2026, 1, 15, 0, 0, tzinfo=UTC)
     _write_partition(
@@ -1410,73 +1594,140 @@ def test_btc_mixed_complexity_plan_keeps_1m_local_and_sends_heavy_higher_tf_nati
                     "taker_buy_vol_btc": 0.5,
                     "taker_buy_vol_usdt": 50.0,
                 }
-                for minute in range(4)
+                for minute in range(10)
             ]
         ),
     )
-    native_calls: list[tuple[str, str, int]] = []
+    higher_tf_root = tmp_path / "futures" / "um" / "higher_timeframes"
+    higher_tf_rows = pl.DataFrame(
+        {
+            "timeframe": ["5m", "5m"],
+            "symbol": ["BTCUSDT", "BTCUSDT"],
+            "timestamp": [
+                datetime(2026, 1, 15, 0, 0, tzinfo=UTC),
+                datetime(2026, 1, 15, 0, 5, tzinfo=UTC),
+            ],
+            "bucket_start": [
+                datetime(2026, 1, 15, 0, 0, tzinfo=UTC),
+                datetime(2026, 1, 15, 0, 5, tzinfo=UTC),
+            ],
+            "bucket_end": [
+                datetime(2026, 1, 15, 0, 5, tzinfo=UTC),
+                datetime(2026, 1, 15, 0, 10, tzinfo=UTC),
+            ],
+            "open": [200.0, 201.0],
+            "high": [201.0, 202.0],
+            "low": [199.0, 200.0],
+            "close": [200.5, 201.5],
+            "volume_btc": [10.0, 11.0],
+            "volume_usdt": [1000.0, 1100.0],
+            "trade_count": [20, 21],
+            "vwap": [200.2, 201.2],
+            "avg_trade_size_btc": [0.5, 0.52],
+            "max_trade_size_btc": [1.0, 1.1],
+            "taker_buy_vol_btc": [6.0, 6.5],
+            "taker_buy_vol_usdt": [600.0, 650.0],
+            "net_taker_vol_btc": [1.0, 1.1],
+            "count_buy_trades": [12, 13],
+            "count_sell_trades": [8, 8],
+            "taker_buy_ratio": [0.6, 0.59],
+            "vol_buy_whale_btc": [0.5, 0.6],
+            "vol_sell_whale_btc": [0.4, 0.5],
+            "vol_buy_retail_btc": [0.3, 0.4],
+            "vol_sell_retail_btc": [0.2, 0.3],
+            "whale_trade_count": [2, 3],
+            "liq_long_vol_usdt": [0.0, 0.0],
+            "liq_short_vol_usdt": [0.0, 0.0],
+            "liq_long_count": [0, 0],
+            "liq_short_count": [0, 0],
+            "liq_avg_fill_price": [None, None],
+            "liq_unfilled_ratio": [None, None],
+            "liq_unfilled_supported": [False, False],
+            "has_liq": [False, False],
+            "oi_contracts": [1000.0, 1001.0],
+            "oi_value_usdt": [1_000_000.0, 1_001_000.0],
+            "top_trader_ls_ratio_acct": [1.1, 1.2],
+            "global_ls_ratio_acct": [0.9, 0.95],
+            "ls_ratio_divergence": [0.2, 0.25],
+            "top_trader_long_pct": [0.55, 0.56],
+            "top_trader_short_pct": [0.45, 0.44],
+            "premium_index": [0.0001, 0.0002],
+            "funding_rate": [0.0003, 0.0004],
+            "predicted_funding": [0.0005, 0.0006],
+            "next_funding_time": [1, 2],
+            "micro_price_close": [200.4, 201.4],
+            "mark_price_open": [200.1, 201.1],
+            "mark_price_close": [200.2, 201.2],
+            "index_price_open": [200.0, 201.0],
+            "index_price_close": [200.0, 201.0],
+            "avg_spread_usdt": [1.0, 1.1],
+            "bid_ask_imbalance": [0.1, 0.2],
+            "avg_bid_depth": [10.0, 11.0],
+            "avg_ask_depth": [12.0, 13.0],
+            "spread_pct": [0.001, 0.0011],
+            "price_impact_100k": [0.002, 0.0021],
+            "has_depth": [True, True],
+            "impact_fillable": [True, True],
+            "depth_degraded": [False, False],
+            "has_ws_latency": [False, False],
+            "ws_latency_bad": [False, False],
+            "has_ls_ratio": [True, True],
+            "realized_vol_htf": [0.01, 0.02],
+            "event_time": [1, 2],
+            "transact_time": [1, 2],
+            "arrival_time": [1, 2],
+            "update_id_start": [10, 20],
+            "update_id_end": [19, 29],
+            "expected_minutes_in_bucket": [5, 5],
+            "observed_minutes_in_bucket": [5, 5],
+            "missing_minutes_count": [0, 0],
+            "bucket_complete": [True, True],
+        }
+    )
+    _write_higher_timeframe_partition(
+        higher_tf_root,
+        "5m",
+        "BTCUSDT",
+        datetime(2026, 1, 15, 0, 0, tzinfo=UTC),
+        higher_tf_rows,
+    )
 
-    class NativeProvider:
-        def fetch_native_candles(
-            self,
-            symbol: str,
-            start_time: datetime,
-            end_time: datetime,
-            *,
-            interval: str,
-            limit: int,
-        ) -> list[dict[str, object]]:
-            native_calls.append((symbol, interval, limit))
-            base = datetime(2026, 1, 15, 0, 0, tzinfo=UTC)
-            return [
-                {
-                    "open_time": int((base + timedelta(minutes=5 * idx)).timestamp() * 1000),
-                    "open": 200.0 + idx,
-                    "high": 201.0 + idx,
-                    "low": 199.0 + idx,
-                    "close": 200.5 + idx,
-                    "volume_btc": 10.0,
-                    "close_time": int((base + timedelta(minutes=5 * idx + 5)).timestamp() * 1000),
-                    "volume_usdt": 1000.0,
-                    "trade_count": 20,
-                    "taker_buy_vol_btc": 6.0,
-                    "taker_buy_vol_usdt": 600.0,
-                }
-                for idx in range(limit)
-            ]
+    class GuardProvider:
+        def fetch_native_candles(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
+            raise AssertionError("BTC higher timeframe should use the local higher timeframe lake")
 
         def build_canonical_minutes(self, *args: object, **kwargs: object) -> pl.DataFrame:
-            raise AssertionError("mixed complexity split should not patch through 1m")
+            raise AssertionError("mixed split should not patch through Binance")
 
         def close(self) -> None:
             return None
 
     service = LiveDataApiService(
         repository=MinuteLakeRepository(tmp_path),
-        provider=NativeProvider(),
+        higher_timeframe_repository=HigherTimeframeRepository(higher_tf_root),
+        provider=GuardProvider(),
         default_limit=20,
         max_limit=500,
         on_demand_max_minutes=60_480,
-        btc_local_max_higher_tf_bars=1,
     )
     client = TestClient(create_app(service))
 
     response = client.get(
         "/api/v1/perpetual-data",
-        params={"coin": "BTC", "tfs": "1m=2,5m=2", "end_time": "2026-01-15T00:03:00Z"},
+        params={"coin": "BTC", "tfs": "1m=2,5m=2", "end_time": "2026-01-15T00:09:00Z"},
     )
 
     assert response.status_code == 200
     payload = response.json()
     one_minute_metadata = payload["timeframe_metadata"]["1m"]
     five_minute_metadata = payload["timeframe_metadata"]["5m"]
-    assert payload["source"] == "mixed"
-    assert native_calls == [("BTCUSDT", "5m", 2)]
+    assert payload["source"] == "local"
     assert one_minute_metadata["source_strategy"] == "local_minute_lake_preferred"
     assert one_minute_metadata["local_minute_lake_used"] is True
     assert "btc_local_path_selected" in one_minute_metadata["notes"]
-    assert five_minute_metadata["source"] == "binance_native"
-    assert "btc_higher_tf_binance_fallback" in five_minute_metadata["notes"]
+    assert five_minute_metadata["source"] == "local"
+    assert five_minute_metadata["source_strategy"] == "local_higher_timeframe_lake"
+    assert "using_local_btc_higher_timeframe_lake" in five_minute_metadata["notes"]
 
 
 def test_api_endpoint_uses_legacy_aggregation_when_feature_disabled(tmp_path: Path) -> None:

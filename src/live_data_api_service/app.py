@@ -6,6 +6,7 @@ from time import perf_counter
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 
+from binance_minute_lake.core.binance_usage import binance_usage_scope
 from binance_minute_lake.core.config import Settings
 from binance_minute_lake.sources.rest import BinanceRESTClient
 from binance_minute_lake.sources.websocket import InMemoryLiveCollector, LiveEventStore
@@ -15,7 +16,7 @@ from live_indicators.service import build_indicator_payload
 from .capabilities import FetchPlannerConfig
 from .parallel_provider import ParallelLiveBinanceProvider
 from .config import ApiServiceSettings
-from .repository import MinuteLakeRepository
+from .repository import HigherTimeframeRepository, MinuteLakeRepository
 from .service import LiveDataApiService
 from .timeframes import normalize_symbol
 from .ws_manager import get_ws_manager
@@ -28,6 +29,9 @@ def _default_service() -> LiveDataApiService:
     api_settings = ApiServiceSettings()
 
     repository = MinuteLakeRepository(lake_settings.root_dir)
+    higher_timeframe_repository = HigherTimeframeRepository(
+        lake_settings.root_dir / "futures" / "um" / "higher_timeframes"
+    )
     state_store = SQLiteStateStore(lake_settings.state_db) if lake_settings.state_db.exists() else None
     shared_live_symbol = normalize_symbol(api_settings.shared_live_symbol or lake_settings.symbol)
     shared_live_event_db = (
@@ -79,6 +83,7 @@ def _default_service() -> LiveDataApiService:
 
     return LiveDataApiService(
         repository=repository,
+        higher_timeframe_repository=higher_timeframe_repository,
         provider=provider,
         default_limit=api_settings.default_limit,
         max_limit=api_settings.max_limit,
@@ -89,6 +94,7 @@ def _default_service() -> LiveDataApiService:
         state_store=state_store,
         local_watermark_tolerance_minutes=lake_settings.safety_lag_minutes,
         include_deprecated_fields=api_settings.include_deprecated_fields,
+        enable_ws_warmup=api_settings.enable_ws_warmup,
         enable_local_symbol_fastpath=api_settings.enable_local_symbol_fastpath,
         local_preferred_symbols=api_settings.local_preferred_symbols.split(","),
         local_symbol_require_full_coverage=api_settings.local_symbol_require_full_coverage,
@@ -117,12 +123,12 @@ def create_app(service: LiveDataApiService | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         ws_manager = getattr(active_service, "_ws_manager", None)
+        api_settings = ApiServiceSettings()
 
-        # Pre-warm WS subscriptions for any symbols listed in BML_API_WS_SYMBOLS.
-        # These start immediately on service startup rather than waiting for the
-        # first HTTP request for that symbol.
-        if ws_manager is not None:
-            api_settings = ApiServiceSettings()
+        # Optional startup pre-warm for symbols listed in BML_API_WS_SYMBOLS.
+        # Disabled by default so the live price service does not open WS
+        # subscriptions on its own unless explicitly configured to do so.
+        if ws_manager is not None and api_settings.enable_ws_warmup:
             raw_symbols = [s.strip() for s in api_settings.ws_symbols.split(",") if s.strip()]
             for raw in raw_symbols:
                 try:
@@ -147,10 +153,20 @@ def create_app(service: LiveDataApiService | None = None) -> FastAPI:
     @app.middleware("http")
     async def capture_response_time(request: Request, call_next):
         request.state.started_at = perf_counter()
-        response = await call_next(request)
-        if "X-Response-Time-Secs" not in response.headers:
-            response.headers["X-Response-Time-Secs"] = f"{_elapsed_seconds(request.state.started_at):.6f}"
-        return response
+        if not request.url.path.startswith("/api/"):
+            response = await call_next(request)
+            if "X-Response-Time-Secs" not in response.headers:
+                response.headers["X-Response-Time-Secs"] = f"{_elapsed_seconds(request.state.started_at):.6f}"
+            return response
+
+        with binance_usage_scope(request.url.path) as usage_tracker:
+            try:
+                response = await call_next(request)
+            finally:
+                LOGGER.info("Binance usage summary", extra=usage_tracker.as_log_fields())
+            if "X-Response-Time-Secs" not in response.headers:
+                response.headers["X-Response-Time-Secs"] = f"{_elapsed_seconds(request.state.started_at):.6f}"
+            return response
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
