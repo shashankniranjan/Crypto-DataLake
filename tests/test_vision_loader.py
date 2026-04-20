@@ -23,6 +23,15 @@ class _FakeVisionClient:
         raise AssertionError(f"unexpected download attempt for {url} -> {destination}")
 
 
+class _CountingMissingVisionClient(_FakeVisionClient):
+    def __init__(self) -> None:
+        self.exists_calls = 0
+
+    def exists(self, url: str) -> bool:
+        self.exists_calls += 1
+        return False
+
+
 def _write_zip_csv(path: Path, filename: str, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(path, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -54,6 +63,27 @@ def test_vision_loader_parses_current_agg_trades_headers(tmp_path: Path) -> None
     assert rows[0]["agg_trade_id"] == 1
     assert rows[0]["transact_time"] == 1775779201085
     assert rows[0]["is_buyer_maker"] is False
+
+
+def test_vision_loader_caches_missing_zip_probe(tmp_path: Path) -> None:
+    client = _CountingMissingVisionClient()
+    loader = VisionLoader(client, tmp_path, missing_cache_ttl_seconds=3600)
+
+    for _ in range(2):
+        rows = loader.load_klines(
+            "KITEUSDT",
+            start=datetime(2026, 4, 11, 0, 0, tzinfo=UTC),
+            end=datetime(2026, 4, 11, 0, 1, tzinfo=UTC),
+        )
+        assert rows == []
+
+    assert client.exists_calls == 1
+    assert (
+        tmp_path
+        / "klines"
+        / "KITEUSDT"
+        / "KITEUSDT-klines-2026-04-11.zip.missing"
+    ).exists()
 
 
 def test_vision_loader_exposes_direct_oi_columns_from_metrics(tmp_path: Path) -> None:

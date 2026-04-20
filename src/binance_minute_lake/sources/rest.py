@@ -5,6 +5,7 @@ import random
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from threading import Lock
 from typing import Any
 
 import httpx
@@ -33,6 +34,7 @@ class BinanceRESTClient:
         self._max_backoff_seconds = 60.0
         self._min_interval_seconds = 0.1  # ~10 requests/sec to avoid burst 429s
         self._last_request_monotonic: float | None = None
+        self._rate_limit_lock = Lock()
 
     def close(self) -> None:
         self._client.close()
@@ -43,13 +45,14 @@ class BinanceRESTClient:
         for attempt in range(1, self._retries + 1):
             try:
                 # simple client-side rate limiter to avoid 429 bursts
-                now = time.monotonic()
-                if self._last_request_monotonic is not None:
-                    wait = self._min_interval_seconds - (now - self._last_request_monotonic)
-                    if wait > 0:
-                        time.sleep(wait)
-                response = self._client.get(path, params=params)
-                self._last_request_monotonic = time.monotonic()
+                with self._rate_limit_lock:
+                    now = time.monotonic()
+                    if self._last_request_monotonic is not None:
+                        wait = self._min_interval_seconds - (now - self._last_request_monotonic)
+                        if wait > 0:
+                            time.sleep(wait)
+                    response = self._client.get(path, params=params)
+                    self._last_request_monotonic = time.monotonic()
             except httpx.TransportError as exc:
                 last_transport_error = exc
                 if attempt >= self._retries:

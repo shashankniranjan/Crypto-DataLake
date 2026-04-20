@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 import zipfile
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
@@ -17,9 +18,10 @@ logger = logging.getLogger(__name__)
 class VisionLoader:
     """Helper that downloads and parses Binance Vision daily zip files into record lists."""
 
-    def __init__(self, client: VisionClient, cache_dir: Path) -> None:
+    def __init__(self, client: VisionClient, cache_dir: Path, missing_cache_ttl_seconds: int = 1_800) -> None:
         self._client = client
         self._cache_dir = cache_dir
+        self._missing_cache_ttl_seconds = max(missing_cache_ttl_seconds, 0)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
     # public API -------------------------------------------------------------
@@ -246,14 +248,24 @@ class VisionLoader:
     ) -> pl.DataFrame:
         url = self._client.build_daily_zip_url(stream=stream, symbol=symbol, trade_date=trade_date, interval=interval)
         zip_path = self._cache_path(stream, symbol, trade_date, interval)
+        missing_path = self._missing_cache_path(zip_path)
         if not zip_path.exists():
+            if self._missing_cache_is_fresh(missing_path):
+                logger.debug(
+                    "vision object missing cache hit",
+                    extra={"stream": stream, "symbol": symbol, "date": trade_date.isoformat(), "url": url},
+                )
+                return pl.DataFrame(schema=schema)
             if not self._client.exists(url):
                 logger.warning(
                     "vision object missing",
                     extra={"stream": stream, "symbol": symbol, "date": trade_date.isoformat(), "url": url},
                 )
+                self._write_missing_cache_marker(missing_path)
                 return pl.DataFrame(schema=schema)
             self._client.download_zip(url, zip_path)
+        else:
+            self._clear_missing_cache_marker(missing_path)
 
         with zipfile.ZipFile(zip_path, mode="r") as archive:
             csv_files = [name for name in archive.namelist() if name.endswith(".csv")]
@@ -283,3 +295,28 @@ class VisionLoader:
             interval=interval,
         )
         return self._cache_dir / stream / symbol.upper() / filename
+
+    @staticmethod
+    def _missing_cache_path(zip_path: Path) -> Path:
+        return zip_path.with_name(f"{zip_path.name}.missing")
+
+    def _missing_cache_is_fresh(self, missing_path: Path) -> bool:
+        if self._missing_cache_ttl_seconds < 1 or not missing_path.exists():
+            return False
+        age_seconds = time.time() - missing_path.stat().st_mtime
+        if age_seconds <= self._missing_cache_ttl_seconds:
+            return True
+        self._clear_missing_cache_marker(missing_path)
+        return False
+
+    @staticmethod
+    def _write_missing_cache_marker(missing_path: Path) -> None:
+        missing_path.parent.mkdir(parents=True, exist_ok=True)
+        missing_path.touch()
+
+    @staticmethod
+    def _clear_missing_cache_marker(missing_path: Path) -> None:
+        try:
+            missing_path.unlink()
+        except FileNotFoundError:
+            return

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic, perf_counter
 from typing import Any, cast
 
@@ -78,6 +78,47 @@ class _TimeframeCacheEntry:
     expires_at_monotonic: float
 
 
+@dataclass(slots=True)
+class _TimeframeInFlight:
+    event: Event
+    result: TimeframeCandleResult | None = None
+    exception: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalPatchCacheKey:
+    symbol: str
+    start_time: datetime
+    end_time: datetime
+    live_collector_used: bool
+
+
+@dataclass(slots=True)
+class _CanonicalPatchCacheEntry:
+    frame: pl.DataFrame
+    expires_at_monotonic: float
+
+
+@dataclass(slots=True)
+class _CanonicalPatchInFlight:
+    event: Event
+    frame: pl.DataFrame | None = None
+    exception: BaseException | None = None
+
+
+@dataclass(slots=True)
+class _SnapshotCacheEntry:
+    result: dict[str, object]
+    expires_at_monotonic: float
+
+
+@dataclass(slots=True)
+class _SnapshotInFlight:
+    event: Event
+    result: dict[str, object] | None = None
+    exception: BaseException | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class _NativeCandleEndpointFamily:
     method_name: str
@@ -140,6 +181,8 @@ class LiveDataApiService:
         timeframe_cache_max_entries: int = 256,
         timeframe_cache_stable_ttl_seconds: int = 21_600,
         timeframe_cache_recent_ttl_seconds: int = 15,
+        canonical_patch_cache_max_entries: int = 128,
+        premium_index_snapshot_cache_ttl_seconds: float = 1.0,
     ) -> None:
         self._repository = repository
         self._higher_timeframe_repository = higher_timeframe_repository
@@ -174,6 +217,15 @@ class LiveDataApiService:
         self._timeframe_cache_recent_ttl_seconds = max(timeframe_cache_recent_ttl_seconds, 0)
         self._timeframe_cache_lock = Lock()
         self._timeframe_cache: OrderedDict[_TimeframeCacheKey, _TimeframeCacheEntry] = OrderedDict()
+        self._timeframe_inflight: dict[_TimeframeCacheKey, _TimeframeInFlight] = {}
+        self._canonical_patch_cache_max_entries = max(canonical_patch_cache_max_entries, 0)
+        self._canonical_patch_cache_lock = Lock()
+        self._canonical_patch_cache: OrderedDict[_CanonicalPatchCacheKey, _CanonicalPatchCacheEntry] = OrderedDict()
+        self._canonical_patch_inflight: dict[_CanonicalPatchCacheKey, _CanonicalPatchInFlight] = {}
+        self._premium_index_snapshot_cache_ttl_seconds = max(float(premium_index_snapshot_cache_ttl_seconds), 0.0)
+        self._premium_index_snapshot_cache_lock = Lock()
+        self._premium_index_snapshot_cache: dict[str, _SnapshotCacheEntry] = {}
+        self._premium_index_snapshot_inflight: dict[str, _SnapshotInFlight] = {}
 
     def close(self) -> None:
         close = getattr(self._provider, "close", None)
@@ -342,7 +394,7 @@ class LiveDataApiService:
         if not candidates:
             return None
 
-        best_key, best_entry = min(candidates, key=lambda item: item[0].limit)
+        _, best_entry = min(candidates, key=lambda item: item[0].limit)
         record_binance_cache_event("timeframe_cache_hit_superset")
         metadata = dict(best_entry.result.metadata)
         notes = metadata.get("notes")
@@ -419,6 +471,227 @@ class LiveDataApiService:
 
             while len(self._timeframe_cache) > self._timeframe_cache_max_entries:
                 self._timeframe_cache.popitem(last=False)
+
+    def _claim_timeframe_fetch(self, key: _TimeframeCacheKey) -> tuple[_TimeframeInFlight, bool]:
+        inflight = _TimeframeInFlight(event=Event())
+        with self._timeframe_cache_lock:
+            existing = self._timeframe_inflight.get(key)
+            if existing is not None:
+                return existing, False
+            self._timeframe_inflight[key] = inflight
+            return inflight, True
+
+    def _finish_timeframe_fetch(
+        self,
+        key: _TimeframeCacheKey,
+        inflight: _TimeframeInFlight,
+        *,
+        result: TimeframeCandleResult | None = None,
+        exception: BaseException | None = None,
+    ) -> None:
+        with self._timeframe_cache_lock:
+            if self._timeframe_inflight.get(key) is inflight:
+                self._timeframe_inflight.pop(key, None)
+                inflight.result = result
+                inflight.exception = exception
+                inflight.event.set()
+
+    def _wait_for_timeframe_fetch(
+        self,
+        inflight: _TimeframeInFlight,
+        *,
+        started_at: float,
+    ) -> TimeframeCandleResult:
+        inflight.event.wait()
+        if inflight.exception is not None:
+            raise inflight.exception
+        if inflight.result is None:
+            raise RuntimeError("Timeframe fetch completed without a result")
+        record_binance_cache_event("timeframe_cache_hit_inflight")
+        return self._clone_timeframe_result(
+            inflight.result,
+            latency_secs=round(max(perf_counter() - started_at, 0.0), 6),
+            served_from_cache=True,
+            cache_hit_type="inflight",
+        )
+
+    def _canonical_patch_cache_ttl_seconds(self, resolved_end: datetime) -> int:
+        if last_completed_utc_minute() > resolved_end:
+            return self._timeframe_cache_stable_ttl_seconds
+        return self._timeframe_cache_recent_ttl_seconds
+
+    def _get_cached_canonical_patch_frame(
+        self,
+        key: _CanonicalPatchCacheKey,
+    ) -> pl.DataFrame | None:
+        if self._canonical_patch_cache_max_entries < 1:
+            return None
+
+        now = monotonic()
+        with self._canonical_patch_cache_lock:
+            entry = self._canonical_patch_cache.get(key)
+            if entry is None:
+                return None
+            if entry.expires_at_monotonic <= now:
+                self._canonical_patch_cache.pop(key, None)
+                return None
+            self._canonical_patch_cache.move_to_end(key)
+        record_binance_cache_event("canonical_patch_cache_hit_exact")
+        return entry.frame.clone()
+
+    def _store_cached_canonical_patch_frame(
+        self,
+        key: _CanonicalPatchCacheKey,
+        *,
+        frame: pl.DataFrame,
+    ) -> None:
+        if self._canonical_patch_cache_max_entries < 1:
+            return
+
+        ttl_seconds = self._canonical_patch_cache_ttl_seconds(key.end_time)
+        if ttl_seconds < 1:
+            return
+
+        now = monotonic()
+        with self._canonical_patch_cache_lock:
+            self._canonical_patch_cache[key] = _CanonicalPatchCacheEntry(
+                frame=frame.clone(),
+                expires_at_monotonic=now + ttl_seconds,
+            )
+            self._canonical_patch_cache.move_to_end(key)
+            expired_keys = [
+                cache_key
+                for cache_key, cache_entry in self._canonical_patch_cache.items()
+                if cache_entry.expires_at_monotonic <= now
+            ]
+            for expired_key in expired_keys:
+                self._canonical_patch_cache.pop(expired_key, None)
+            while len(self._canonical_patch_cache) > self._canonical_patch_cache_max_entries:
+                self._canonical_patch_cache.popitem(last=False)
+
+    def _claim_canonical_patch_fetch(
+        self,
+        key: _CanonicalPatchCacheKey,
+    ) -> tuple[_CanonicalPatchInFlight, bool]:
+        inflight = _CanonicalPatchInFlight(event=Event())
+        with self._canonical_patch_cache_lock:
+            existing = self._canonical_patch_inflight.get(key)
+            if existing is not None:
+                return existing, False
+            self._canonical_patch_inflight[key] = inflight
+            return inflight, True
+
+    def _finish_canonical_patch_fetch(
+        self,
+        key: _CanonicalPatchCacheKey,
+        inflight: _CanonicalPatchInFlight,
+        *,
+        frame: pl.DataFrame | None = None,
+        exception: BaseException | None = None,
+    ) -> None:
+        with self._canonical_patch_cache_lock:
+            if self._canonical_patch_inflight.get(key) is inflight:
+                self._canonical_patch_inflight.pop(key, None)
+                inflight.frame = frame.clone() if frame is not None else None
+                inflight.exception = exception
+                inflight.event.set()
+
+    def _wait_for_canonical_patch_fetch(self, inflight: _CanonicalPatchInFlight) -> pl.DataFrame:
+        inflight.event.wait()
+        if inflight.exception is not None:
+            raise inflight.exception
+        if inflight.frame is None:
+            raise RuntimeError("Canonical patch fetch completed without a frame")
+        record_binance_cache_event("canonical_patch_cache_hit_inflight")
+        return inflight.frame.clone()
+
+    def _load_binance_canonical_patch(
+        self,
+        *,
+        symbol: str,
+        window_start: datetime,
+        resolved_end: datetime,
+        provider_kwargs: dict[str, object],
+    ) -> pl.DataFrame:
+        key = _CanonicalPatchCacheKey(
+            symbol=symbol,
+            start_time=window_start,
+            end_time=resolved_end,
+            live_collector_used="live_collector" in provider_kwargs,
+        )
+        cached = self._get_cached_canonical_patch_frame(key)
+        if cached is not None:
+            return cached
+
+        inflight, owns_fetch = self._claim_canonical_patch_fetch(key)
+        if not owns_fetch:
+            return self._wait_for_canonical_patch_fetch(inflight)
+
+        try:
+            provider_build = cast(Any, self._provider).build_canonical_minutes
+            frame = cast(pl.DataFrame, provider_build(symbol, window_start, resolved_end, **provider_kwargs))
+            self._store_cached_canonical_patch_frame(key, frame=frame)
+            self._finish_canonical_patch_fetch(key, inflight, frame=frame)
+            return frame
+        except BaseException as exc:
+            self._finish_canonical_patch_fetch(key, inflight, exception=exc)
+            raise
+
+    def _fetch_cached_native_premium_index_snapshot(self, symbol: str) -> dict[str, object] | None:
+        snapshot_fetcher = getattr(self._provider, "fetch_native_premium_index_snapshot", None)
+        if not callable(snapshot_fetcher):
+            return None
+
+        cache_key = symbol.upper()
+        now = monotonic()
+        with self._premium_index_snapshot_cache_lock:
+            cached = self._premium_index_snapshot_cache.get(cache_key)
+            if cached is not None and cached.expires_at_monotonic > now:
+                record_binance_cache_event("premium_index_snapshot_cache_hit_exact")
+                return dict(cached.result)
+            if cached is not None:
+                self._premium_index_snapshot_cache.pop(cache_key, None)
+
+            existing = self._premium_index_snapshot_inflight.get(cache_key)
+            if existing is not None:
+                inflight = existing
+                owns_fetch = False
+            else:
+                inflight = _SnapshotInFlight(event=Event())
+                self._premium_index_snapshot_inflight[cache_key] = inflight
+                owns_fetch = True
+
+        if not owns_fetch:
+            inflight.event.wait()
+            if inflight.exception is not None:
+                raise inflight.exception
+            if inflight.result is None:
+                raise RuntimeError("Premium-index snapshot fetch completed without a result")
+            record_binance_cache_event("premium_index_snapshot_cache_hit_inflight")
+            return dict(inflight.result)
+
+        try:
+            result = snapshot_fetcher(symbol)
+            result_dict = dict(cast(Mapping[str, object], result))
+        except BaseException as exc:
+            with self._premium_index_snapshot_cache_lock:
+                if self._premium_index_snapshot_inflight.get(cache_key) is inflight:
+                    self._premium_index_snapshot_inflight.pop(cache_key, None)
+                    inflight.exception = exc
+                    inflight.event.set()
+            raise
+
+        with self._premium_index_snapshot_cache_lock:
+            if self._premium_index_snapshot_cache_ttl_seconds > 0:
+                self._premium_index_snapshot_cache[cache_key] = _SnapshotCacheEntry(
+                    result=result_dict,
+                    expires_at_monotonic=monotonic() + self._premium_index_snapshot_cache_ttl_seconds,
+                )
+            if self._premium_index_snapshot_inflight.get(cache_key) is inflight:
+                self._premium_index_snapshot_inflight.pop(cache_key, None)
+                inflight.result = result_dict
+                inflight.event.set()
+        return dict(result_dict)
 
     def _btc_local_complexity_notes(self, spec: TimeframeSpec, limit: int) -> list[str]:
         if not self._enable_btc_complexity_guard:
@@ -569,14 +842,22 @@ class LiveDataApiService:
             if local_can_serve_predicate is not None
             else local_frame.height >= expected_rows
         )
-        should_try_binance = allow_binance_patch and not local_can_serve and expected_rows <= self._on_demand_max_minutes
+        should_try_binance = (
+            allow_binance_patch
+            and not local_can_serve
+            and expected_rows <= self._on_demand_max_minutes
+        )
         if should_try_binance:
-            provider_build = cast(Any, self._provider).build_canonical_minutes
-            provider_signature = inspect.signature(provider_build)
+            provider_signature = inspect.signature(cast(Any, self._provider).build_canonical_minutes)
             provider_kwargs = {}
             if live_collector is not None and "live_collector" in provider_signature.parameters:
                 provider_kwargs["live_collector"] = live_collector
-            remote_frame = provider_build(symbol, window_start, resolved_end, **provider_kwargs)
+            remote_frame = self._load_binance_canonical_patch(
+                symbol=symbol,
+                window_start=window_start,
+                resolved_end=resolved_end,
+                provider_kwargs=provider_kwargs,
+            )
             if local_frame.height > 0:
                 combined_frame = merge_canonical_frames(remote_frame, local_frame)
                 source = "local+binance"
@@ -768,7 +1049,6 @@ class LiveDataApiService:
             return frame
 
         target_cols = list(value_map.values())
-        before = _populated_count(frame, target_cols)
         exact = align_series(
             frame,
             rows,
@@ -1019,21 +1299,22 @@ class LiveDataApiService:
             },
         )
 
-        snapshot_fetcher = getattr(self._provider, "fetch_native_premium_index_snapshot", None)
-        if callable(snapshot_fetcher) and result.height > 0:
+        if result.height > 0:
             try:
-                snapshot = snapshot_fetcher(symbol)
-                event_time = snapshot.get("event_time")
-                next_funding_time = snapshot.get("next_funding_time")
-                if event_time and next_funding_time:
+                snapshot = self._fetch_cached_native_premium_index_snapshot(symbol)
+                event_time = snapshot.get("event_time") if snapshot is not None else None
+                next_funding_time = snapshot.get("next_funding_time") if snapshot is not None else None
+                if isinstance(event_time, int | float | str) and isinstance(next_funding_time, int | float | str):
                     latest_timestamp = result.get_column("timestamp").max()
                     if isinstance(latest_timestamp, datetime):
                         latest_ms = int(latest_timestamp.timestamp() * 1000)
                         bar_close_ms = latest_ms + spec.minutes * 60_000
-                        if latest_ms <= int(event_time) <= bar_close_ms:
+                        event_time_ms = int(event_time)
+                        next_funding_time_ms = int(next_funding_time)
+                        if latest_ms <= event_time_ms <= bar_close_ms:
                             result = result.with_columns(
                                 pl.when(pl.col("timestamp") == latest_timestamp)
-                                .then(pl.lit(int(next_funding_time)))
+                                .then(pl.lit(next_funding_time_ms))
                                 .otherwise(pl.col("next_funding_time"))
                                 .alias("next_funding_time")
                             )
@@ -1420,54 +1701,64 @@ class LiveDataApiService:
                         )
                         record_binance_cache_event("timeframe_cache_extended_from_partial_window")
                         return result
-                rows = fetch_native(
-                    symbol,
-                    start_time,
-                    resolved_end,
-                    interval=decision.binance_interval,
-                    limit=limit,
-                )
-                frame = self._native_klines_to_frame(rows).tail(limit)
-                frame = self._enrich_native_frame(
-                    frame,
-                    symbol=symbol,
-                    spec=spec,
-                    start_time=start_time,
-                    end_time=resolved_end,
-                    interval=decision.binance_interval,
-                    limit=limit,
-                    notes=notes,
-                )
-                elapsed = round(max(perf_counter() - started_at, 0.0), 6)
-                LOGGER.info(
-                    "Native Binance candle fetch selected",
-                    extra={
-                        "symbol": symbol,
-                        "timeframe": spec.api_name,
-                        "interval": decision.binance_interval,
-                        "rows": frame.height,
-                        "latency_secs": elapsed,
-                    },
-                )
-                result = TimeframeCandleResult(
-                    frame=frame,
-                    metadata={
-                        "source": decision.candle_source,
-                        "fetch_mode": decision.fetch_mode,
-                        "fallback_used": False,
-                        "binance_interval": decision.binance_interval,
-                        "served_from_cache": False,
-                        "notes": _clean_metadata_notes(notes),
-                        "latency_secs": elapsed,
-                    },
-                )
-                self._store_cached_timeframe_result(
-                    cache_key,
-                    spec=spec,
-                    resolved_end=resolved_end,
-                    result=result,
-                )
-                return result
+
+                inflight, owns_fetch = self._claim_timeframe_fetch(cache_key)
+                if not owns_fetch:
+                    return self._wait_for_timeframe_fetch(inflight, started_at=started_at)
+
+                try:
+                    rows = fetch_native(
+                        symbol,
+                        start_time,
+                        resolved_end,
+                        interval=decision.binance_interval,
+                        limit=limit,
+                    )
+                    frame = self._native_klines_to_frame(rows).tail(limit)
+                    frame = self._enrich_native_frame(
+                        frame,
+                        symbol=symbol,
+                        spec=spec,
+                        start_time=start_time,
+                        end_time=resolved_end,
+                        interval=decision.binance_interval,
+                        limit=limit,
+                        notes=notes,
+                    )
+                    elapsed = round(max(perf_counter() - started_at, 0.0), 6)
+                    LOGGER.info(
+                        "Native Binance candle fetch selected",
+                        extra={
+                            "symbol": symbol,
+                            "timeframe": spec.api_name,
+                            "interval": decision.binance_interval,
+                            "rows": frame.height,
+                            "latency_secs": elapsed,
+                        },
+                    )
+                    result = TimeframeCandleResult(
+                        frame=frame,
+                        metadata={
+                            "source": decision.candle_source,
+                            "fetch_mode": decision.fetch_mode,
+                            "fallback_used": False,
+                            "binance_interval": decision.binance_interval,
+                            "served_from_cache": False,
+                            "notes": _clean_metadata_notes(notes),
+                            "latency_secs": elapsed,
+                        },
+                    )
+                    self._store_cached_timeframe_result(
+                        cache_key,
+                        spec=spec,
+                        resolved_end=resolved_end,
+                        result=result,
+                    )
+                    self._finish_timeframe_fetch(cache_key, inflight, result=result)
+                    return result
+                except BaseException as exc:
+                    self._finish_timeframe_fetch(cache_key, inflight, exception=exc)
+                    raise
             notes.append("native_candle_provider_method_unavailable")
 
         if self._fetch_planner_config.allow_legacy_1m_fallback:
@@ -1626,7 +1917,10 @@ class LiveDataApiService:
 
         if len(timeframe_requests) > 1:
             with ThreadPoolExecutor(max_workers=len(timeframe_requests)) as executor:
-                futures = [executor.submit(copy_context().run, _aggregate_one, request) for request in timeframe_requests]
+                futures = [
+                    executor.submit(copy_context().run, _aggregate_one, request)
+                    for request in timeframe_requests
+                ]
                 fetched = dict(future.result() for future in futures)
         else:
             fetched = dict(map(_aggregate_one, timeframe_requests))

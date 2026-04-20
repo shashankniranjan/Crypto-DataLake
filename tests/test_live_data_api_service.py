@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from math import log
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 
 import polars as pl
@@ -53,7 +56,7 @@ def _write_higher_timeframe_partition(
 ) -> None:
     target = (
         root_dir
-        / "timeframe={timeframe}".format(timeframe=timeframe)
+        / f"timeframe={timeframe}"
         / f"symbol={symbol}"
         / f"year={day_start:%Y}"
         / f"month={day_start:%m}"
@@ -1259,6 +1262,82 @@ def test_api_endpoint_reuses_cached_native_candle_response_for_same_request(tmp_
     assert second.json()["timeframe_metadata"]["5m"]["cache_hit_type"] == "exact"
 
 
+def test_service_deduplicates_concurrent_native_candle_request(tmp_path: Path) -> None:
+    native_calls: list[tuple[str, str, int]] = []
+    fetch_started = Event()
+    release_fetch = Event()
+
+    class BlockingNativeProvider:
+        def fetch_native_candles(
+            self,
+            symbol: str,
+            start_time: datetime,
+            end_time: datetime,
+            *,
+            interval: str,
+            limit: int,
+        ) -> list[dict[str, object]]:
+            native_calls.append((symbol, interval, limit))
+            fetch_started.set()
+            assert release_fetch.wait(timeout=2.0)
+            base = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
+            return [
+                {
+                    "open_time": int((base + timedelta(minutes=5 * idx)).timestamp() * 1000),
+                    "open": 100.0 + idx,
+                    "high": 101.0 + idx,
+                    "low": 99.0 + idx,
+                    "close": 100.5 + idx,
+                    "volume_btc": 10.0,
+                    "close_time": int((base + timedelta(minutes=5 * idx + 5)).timestamp() * 1000),
+                    "volume_usdt": 1000.0,
+                    "trade_count": 20,
+                    "taker_buy_vol_btc": 6.0,
+                    "taker_buy_vol_usdt": 600.0,
+                }
+                for idx in range(limit)
+            ]
+
+        def close(self) -> None:
+            return None
+
+    service = LiveDataApiService(
+        repository=MinuteLakeRepository(tmp_path),
+        provider=BlockingNativeProvider(),
+        default_limit=20,
+        max_limit=500,
+        on_demand_max_minutes=60_480,
+    )
+
+    spec = parse_timeframe_requests("5m")[0].spec
+    end_time = datetime(2026, 1, 15, 10, 9, tzinfo=UTC)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            service.load_candle_bars,
+            coin="ETH",
+            spec=spec,
+            limit=2,
+            end_time=end_time,
+        )
+        assert fetch_started.wait(timeout=2.0)
+        second = executor.submit(
+            service.load_candle_bars,
+            coin="ETH",
+            spec=spec,
+            limit=2,
+            end_time=end_time,
+        )
+        time.sleep(0.05)
+        release_fetch.set()
+        results = [first.result(timeout=2.0), second.result(timeout=2.0)]
+
+    cache_metadata = [result.metadata for result in results]
+    assert native_calls == [("ETHUSDT", "5m", 2)]
+    assert any(metadata["served_from_cache"] is False for metadata in cache_metadata)
+    assert any(metadata.get("cache_hit_type") == "inflight" for metadata in cache_metadata)
+
+
 def test_service_extends_cached_native_candle_window_with_only_missing_bars(tmp_path: Path) -> None:
     native_calls: list[tuple[str, str, int, datetime]] = []
 
@@ -1330,6 +1409,146 @@ def test_service_extends_cached_native_candle_window_with_only_missing_bars(tmp_
         ("ETHUSDT", "5m", 2),
         ("ETHUSDT", "5m", 3),
     ]
+
+
+def test_service_deduplicates_concurrent_canonical_binance_patch(tmp_path: Path) -> None:
+    build_calls: list[tuple[str, datetime, datetime]] = []
+    build_started = Event()
+    release_build = Event()
+
+    class BlockingCanonicalProvider:
+        def build_canonical_minutes(
+            self,
+            symbol: str,
+            start_time: datetime,
+            end_time: datetime,
+        ) -> pl.DataFrame:
+            build_calls.append((symbol, start_time, end_time))
+            build_started.set()
+            assert release_build.wait(timeout=2.0)
+            return _canonical_frame(
+                [
+                    {
+                        "timestamp": start_time,
+                        "open": 100.0,
+                        "high": 101.0,
+                        "low": 99.0,
+                        "close": 100.5,
+                        "volume_btc": 10.0,
+                        "volume_usdt": 1000.0,
+                        "trade_count": 20,
+                    }
+                ]
+            )
+
+        def close(self) -> None:
+            return None
+
+    service = LiveDataApiService(
+        repository=MinuteLakeRepository(tmp_path),
+        provider=BlockingCanonicalProvider(),
+        default_limit=20,
+        max_limit=500,
+        on_demand_max_minutes=60_480,
+    )
+    start_time = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
+    end_time = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            service.load_canonical_window,
+            coin="SAPIEN",
+            start_time=start_time,
+            end_time=end_time,
+        )
+        assert build_started.wait(timeout=2.0)
+        second = executor.submit(
+            service.load_canonical_window,
+            coin="SAPIEN",
+            start_time=start_time,
+            end_time=end_time,
+        )
+        time.sleep(0.05)
+        release_build.set()
+        results = [first.result(timeout=2.0), second.result(timeout=2.0)]
+
+    assert len(build_calls) == 1
+    assert [result.frame.height for result in results] == [1, 1]
+
+
+def test_service_deduplicates_concurrent_premium_index_snapshots(tmp_path: Path) -> None:
+    snapshot_calls: list[str] = []
+    snapshot_started = Event()
+    release_snapshot = Event()
+
+    class SnapshotProvider:
+        def fetch_native_candles(
+            self,
+            symbol: str,
+            start_time: datetime,
+            end_time: datetime,
+            *,
+            interval: str,
+            limit: int,
+        ) -> list[dict[str, object]]:
+            step = 60 if interval == "1h" else int(interval.removesuffix("m"))
+            base = end_time - timedelta(minutes=step * (limit - 1))
+            return [
+                {
+                    "open_time": int((base + timedelta(minutes=step * idx)).timestamp() * 1000),
+                    "open": 100.0 + idx,
+                    "high": 101.0 + idx,
+                    "low": 99.0 + idx,
+                    "close": 100.5 + idx,
+                    "volume_btc": 10.0,
+                    "close_time": int((base + timedelta(minutes=step * idx + step)).timestamp() * 1000),
+                    "volume_usdt": 1000.0,
+                    "trade_count": 20,
+                    "taker_buy_vol_btc": 6.0,
+                    "taker_buy_vol_usdt": 600.0,
+                }
+                for idx in range(limit)
+            ]
+
+        def fetch_native_premium_index_snapshot(self, symbol: str) -> dict[str, object]:
+            snapshot_calls.append(symbol)
+            snapshot_started.set()
+            assert release_snapshot.wait(timeout=2.0)
+            event_time = int(datetime(2026, 1, 15, 10, 14, tzinfo=UTC).timestamp() * 1000)
+            return {
+                "mark_price": 101.0,
+                "index_price": 100.0,
+                "last_funding_rate": 0.0001,
+                "next_funding_time": event_time + 8 * 60 * 60 * 1000,
+                "predicted_funding": 0.0002,
+                "event_time": event_time,
+            }
+
+        def close(self) -> None:
+            return None
+
+    service = LiveDataApiService(
+        repository=MinuteLakeRepository(tmp_path),
+        provider=SnapshotProvider(),
+        default_limit=20,
+        max_limit=500,
+        on_demand_max_minutes=60_480,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            service.fetch_perpetual_data,
+            coin="RLC",
+            tfs="5m=2,15m=2",
+            end_time="2026-01-15T10:14:00Z",
+        )
+        assert snapshot_started.wait(timeout=2.0)
+        time.sleep(0.05)
+        release_snapshot.set()
+        payload = future.result(timeout=2.0)
+
+    assert snapshot_calls == ["RLCUSDT"]
+    assert payload["timeframes"] == ["5m", "15m"]
 
 
 def test_btc_prefers_local_minute_lake_when_coverage_exists(tmp_path: Path) -> None:
