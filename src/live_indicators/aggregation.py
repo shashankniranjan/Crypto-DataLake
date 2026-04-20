@@ -43,10 +43,10 @@ def aggregate_ohlc_bars(
         )
         .agg(
             pl.len().alias("_minute_count"),
-            pl.col("open").first().alias("open"),
+            pl.col("open").drop_nulls().first().alias("open"),
             pl.col("high").max().alias("high"),
             pl.col("low").min().alias("low"),
-            pl.col("close").last().alias("close"),
+            pl.col("close").drop_nulls().last().alias("close"),
         )
         .with_columns(
             pl.col("timestamp").dt.offset_by(spec.offset_by).alias("_period_end"),
@@ -65,6 +65,10 @@ def aggregate_ohlc_bars(
         .filter(
             (pl.col("_period_end") <= end_lit)
             & (pl.col("_minute_count") == pl.col("_expected_minutes"))
+            & pl.col("open").is_not_null()
+            & pl.col("high").is_not_null()
+            & pl.col("low").is_not_null()
+            & pl.col("close").is_not_null()
         )
         .drop("_minute_count", "_period_end", "_expected_minutes")
         .sort("timestamp")

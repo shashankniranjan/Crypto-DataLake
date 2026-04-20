@@ -170,6 +170,7 @@ def build_indicator_payload(
 
     def _compute_ema() -> tuple[pl.DataFrame, float, dict]:
         bars, metadata = _load_bars(ema_spec.api_name, ema_spec.polars_every, ema_history_bars + 1, resolved_end)
+        bars = _drop_incomplete_price_bars(bars, required_columns=("close",))
         if bars.height < ema_length:
             raise ValueError(
                 f"Not enough completed {ema_spec.api_name} bars to calculate EMA({ema_length}). "
@@ -186,6 +187,7 @@ def build_indicator_payload(
 
     def _compute_pivots() -> tuple[dict, dict]:
         bars, metadata = _load_bars(pivot_spec.api_name, pivot_spec.polars_every, 1, pivot_reference_end)
+        bars = _drop_incomplete_price_bars(bars, required_columns=("high", "low", "close"))
         if bars.height == 0:
             raise ValueError(
                 f"Not enough completed {pivot_spec.api_name} bars to calculate traditional pivots."
@@ -236,8 +238,19 @@ def build_indicator_payload(
     }
 
 
+def _drop_incomplete_price_bars(bars: pl.DataFrame, *, required_columns: tuple[str, ...]) -> pl.DataFrame:
+    if bars.height == 0:
+        return bars
+    return bars.filter(pl.all_horizontal(pl.col(column).is_not_null() for column in required_columns))
+
+
 def _float_values(series: pl.Series) -> list[float]:
-    return [float(value) for value in series.to_list()]
+    values: list[float] = []
+    for value in series.to_list():
+        if value is None:
+            raise ValueError(f"{series.name} contains null values")
+        values.append(float(value))
+    return values
 
 
 def _serialize_timestamp(value: object) -> str:

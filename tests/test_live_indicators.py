@@ -9,9 +9,12 @@ from fastapi.testclient import TestClient
 
 from live_data_api_service.app import create_app
 from live_data_api_service.repository import HigherTimeframeRepository, MinuteLakeRepository
-from live_data_api_service.service import LiveDataApiService
+from live_data_api_service.service import LiveDataApiService, TimeframeCandleResult
 from live_data_api_service.utils import cast_canonical_frame
+from live_indicators.aggregation import aggregate_ohlc_bars
 from live_indicators.ema import calculate_tradingview_ema
+from live_indicators.service import build_indicator_payload
+from live_indicators.timeframes import parse_indicator_timeframe
 
 
 def _canonical_frame(rows: list[dict[str, object]]) -> pl.DataFrame:
@@ -66,6 +69,160 @@ def _write_higher_timeframe_partition(
 def test_calculate_tradingview_ema_uses_sma_seed() -> None:
     result = calculate_tradingview_ema([1.0, 2.0, 3.0, 4.0, 5.0], 3)
     assert result == [None, None, 2.0, 3.0, 4.0]
+
+
+def test_indicator_aggregation_uses_non_null_ohlc_values() -> None:
+    start = datetime(2026, 1, 15, 0, 0, tzinfo=UTC)
+    frame = pl.DataFrame(
+        [
+            {"timestamp": start, "open": None, "high": None, "low": None, "close": None},
+            {
+                "timestamp": start + timedelta(minutes=1),
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+            },
+            {
+                "timestamp": start + timedelta(minutes=2),
+                "open": 100.5,
+                "high": 103.0,
+                "low": 100.0,
+                "close": 102.0,
+            },
+            {
+                "timestamp": start + timedelta(minutes=3),
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": None,
+            },
+            {
+                "timestamp": start + timedelta(minutes=4),
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": None,
+            },
+        ],
+        schema={
+            "timestamp": pl.Datetime("ms", "UTC"),
+            "open": pl.Float64,
+            "high": pl.Float64,
+            "low": pl.Float64,
+            "close": pl.Float64,
+        },
+    )
+
+    bars = aggregate_ohlc_bars(
+        frame,
+        parse_indicator_timeframe("5m"),
+        end_time=start + timedelta(minutes=4),
+    )
+
+    assert bars.to_dicts() == [
+        {
+            "timestamp": start,
+            "open": 100.0,
+            "high": 103.0,
+            "low": 99.0,
+            "close": 102.0,
+        }
+    ]
+
+
+def test_build_indicator_payload_ignores_null_ema_close_bars() -> None:
+    resolved_end = datetime(2026, 1, 15, 0, 20, tzinfo=UTC)
+
+    def _frame(rows: list[dict[str, object]]) -> pl.DataFrame:
+        return pl.DataFrame(
+            rows,
+            schema={
+                "timestamp": pl.Datetime("ms", "UTC"),
+                "open": pl.Float64,
+                "high": pl.Float64,
+                "low": pl.Float64,
+                "close": pl.Float64,
+            },
+        )
+
+    class SparseService:
+        def resolve_end_time(self, *, coin: str, end_time: str | None = None) -> datetime:
+            return resolved_end
+
+        def load_candle_bars(
+            self,
+            *,
+            coin: str,
+            spec: object,
+            limit: int,
+            end_time: datetime,
+        ) -> TimeframeCandleResult:
+            api_name = spec.api_name  # type: ignore[attr-defined]
+            if api_name == "5m":
+                return TimeframeCandleResult(
+                    frame=_frame(
+                        [
+                            {
+                                "timestamp": resolved_end - timedelta(minutes=15),
+                                "open": 100.0,
+                                "high": 100.0,
+                                "low": 100.0,
+                                "close": 100.0,
+                            },
+                            {
+                                "timestamp": resolved_end - timedelta(minutes=10),
+                                "open": None,
+                                "high": None,
+                                "low": None,
+                                "close": None,
+                            },
+                            {
+                                "timestamp": resolved_end - timedelta(minutes=5),
+                                "open": 102.0,
+                                "high": 102.0,
+                                "low": 102.0,
+                                "close": 102.0,
+                            },
+                            {
+                                "timestamp": resolved_end,
+                                "open": 106.0,
+                                "high": 106.0,
+                                "low": 106.0,
+                                "close": 106.0,
+                            },
+                        ]
+                    ),
+                    metadata={"source": "binance", "fetch_mode": "direct_tf", "fallback_used": False},
+                )
+            if api_name == "1hr":
+                return TimeframeCandleResult(
+                    frame=_frame(
+                        [
+                            {
+                                "timestamp": resolved_end - timedelta(hours=1),
+                                "open": 90.0,
+                                "high": 110.0,
+                                "low": 80.0,
+                                "close": 100.0,
+                            }
+                        ]
+                    ),
+                    metadata={"source": "binance", "fetch_mode": "direct_tf", "fallback_used": False},
+                )
+            raise AssertionError(f"unexpected timeframe: {api_name}")
+
+    payload = build_indicator_payload(
+        service=SparseService(),  # type: ignore[arg-type]
+        coin="eth",
+        ema_tf="5m",
+        ema_length=3,
+        pivot_tf="1hr",
+    )
+
+    assert payload["ema"]["bars_used"] == 3
+    assert payload["ema"]["bar_close"] == 106.0
+    assert payload["ema"]["value"] == (100.0 + 102.0 + 106.0) / 3.0
 
 
 def test_live_indicators_endpoint_returns_ema_and_traditional_pivots(tmp_path: Path) -> None:

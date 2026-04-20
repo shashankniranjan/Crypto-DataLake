@@ -1,10 +1,50 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Any
+
+BINANCE_FUTURES_KLINE_ENDPOINTS = frozenset(
+    {
+        "/fapi/v1/klines",
+        "/fapi/v1/markPriceKlines",
+        "/fapi/v1/indexPriceKlines",
+        "/fapi/v1/premiumIndexKlines",
+    }
+)
+BINANCE_FUTURES_REQUEST_WEIGHT_LIMIT_1M = 2400
+
+
+def binance_futures_kline_request_weight(limit: int) -> int:
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+    if limit <= 99:
+        return 1
+    if limit <= 499:
+        return 2
+    if limit <= 1000:
+        return 5
+    return 10
+
+
+def estimate_binance_futures_kline_request_weight(
+    path: str,
+    params: Mapping[str, Any] | None,
+) -> int | None:
+    if path not in BINANCE_FUTURES_KLINE_ENDPOINTS:
+        return None
+    if params is None or "limit" not in params:
+        return None
+    try:
+        limit = int(params["limit"])
+    except (TypeError, ValueError):
+        return None
+    if limit < 1:
+        return None
+    return binance_futures_kline_request_weight(limit)
 
 
 @dataclass(slots=True)
@@ -21,10 +61,33 @@ class BinanceUsageTracker:
     last_weight_headers: dict[str, int] = field(default_factory=dict)
     max_weight_headers: dict[str, int] = field(default_factory=dict)
     cache_event_counts: Counter[str] = field(default_factory=Counter)
+    estimated_kline_weight_total: int = 0
+    estimated_kline_endpoint_weights: Counter[str] = field(default_factory=Counter)
+    estimated_kline_requests: list[dict[str, object]] = field(default_factory=list)
 
-    def record_rest_response(self, *, path: str, status_code: int, headers: dict[str, str]) -> None:
+    def record_rest_response(
+        self,
+        *,
+        path: str,
+        status_code: int,
+        headers: dict[str, str],
+        params: Mapping[str, Any] | None = None,
+    ) -> None:
         self.rest_call_count += 1
         self.endpoint_counts[path] += 1
+        estimated_kline_weight = estimate_binance_futures_kline_request_weight(path, params)
+        if estimated_kline_weight is not None:
+            self.estimated_kline_weight_total += estimated_kline_weight
+            self.estimated_kline_endpoint_weights[path] += estimated_kline_weight
+            request_summary: dict[str, object] = {
+                "path": path,
+                "estimated_weight": estimated_kline_weight,
+            }
+            if params is not None:
+                for key in ("interval", "limit", "symbol", "pair"):
+                    if key in params:
+                        request_summary[key] = params[key]
+            self.estimated_kline_requests.append(request_summary)
 
         if status_code == 429:
             self.status_429_count += 1
@@ -87,6 +150,18 @@ class BinanceUsageTracker:
             "binance_endpoint_counts": dict(self.endpoint_counts),
             "binance_observed_weight_headers": observed_weight_progress,
             "binance_cache_events": dict(self.cache_event_counts),
+            "binance_estimated_kline_weight_total": self.estimated_kline_weight_total,
+            "binance_futures_request_weight_limit_1m": BINANCE_FUTURES_REQUEST_WEIGHT_LIMIT_1M,
+            "binance_estimated_kline_weight_remaining_1m": max(
+                BINANCE_FUTURES_REQUEST_WEIGHT_LIMIT_1M - self.estimated_kline_weight_total,
+                0,
+            ),
+            "binance_estimated_kline_weight_pct_1m": round(
+                (self.estimated_kline_weight_total / BINANCE_FUTURES_REQUEST_WEIGHT_LIMIT_1M) * 100,
+                6,
+            ),
+            "binance_estimated_kline_weight_by_endpoint": dict(self.estimated_kline_endpoint_weights),
+            "binance_estimated_kline_requests": self.estimated_kline_requests,
         }
 
 
@@ -107,11 +182,17 @@ def current_binance_usage_tracker() -> BinanceUsageTracker | None:
     return _CURRENT_TRACKER.get()
 
 
-def record_binance_rest_response(*, path: str, status_code: int, headers: dict[str, str]) -> None:
+def record_binance_rest_response(
+    *,
+    path: str,
+    status_code: int,
+    headers: dict[str, str],
+    params: Mapping[str, Any] | None = None,
+) -> None:
     tracker = current_binance_usage_tracker()
     if tracker is None:
         return
-    tracker.record_rest_response(path=path, status_code=status_code, headers=headers)
+    tracker.record_rest_response(path=path, status_code=status_code, headers=headers, params=params)
 
 
 def record_binance_retry() -> None:

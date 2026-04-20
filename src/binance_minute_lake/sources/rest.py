@@ -62,6 +62,7 @@ class BinanceRESTClient:
                 path=path,
                 status_code=response.status_code,
                 headers={key.lower(): value for key, value in response.headers.items()},
+                params=params,
             )
 
             if response.status_code < 400:

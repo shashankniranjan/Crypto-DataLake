@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from math import log
 from pathlib import Path
@@ -851,7 +852,10 @@ def test_api_endpoint_supports_per_timeframe_limits(tmp_path: Path) -> None:
     assert payload["data"]["1m"][-1]["timestamp"] == "2026-01-15T10:04:00.000Z"
 
 
-def test_api_endpoint_fetches_native_binance_timeframes_when_available(tmp_path: Path) -> None:
+def test_api_endpoint_fetches_native_binance_timeframes_when_available(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     calls: list[tuple[str, str, int]] = []
     oi_calls: list[tuple[str, str, int]] = []
     ratio_calls: list[tuple[str, str, int]] = []
@@ -1080,6 +1084,7 @@ def test_api_endpoint_fetches_native_binance_timeframes_when_available(tmp_path:
         on_demand_max_minutes=60_480,
     )
     client = TestClient(create_app(service))
+    caplog.set_level(logging.INFO, logger="live_data_api_service.service")
 
     response = client.get(
         "/api/v1/perpetual-data",
@@ -1091,6 +1096,32 @@ def test_api_endpoint_fetches_native_binance_timeframes_when_available(tmp_path:
     )
 
     assert response.status_code == 200
+    weight_records = [
+        record
+        for record in caplog.records
+        if record.message.startswith("Perpetual data Binance candle REST weight estimate:")
+    ]
+    assert weight_records
+    weight_record = weight_records[-1]
+    assert weight_record.parsed_timeframe_limits == {"1m": 2, "3m": 2, "5m": 2, "15m": 2, "1hr": 2}
+    assert weight_record.binance_candle_weight_per_timeframe_total == {
+        "1m": 4,
+        "3m": 4,
+        "5m": 4,
+        "15m": 4,
+        "1hr": 4,
+    }
+    assert weight_record.binance_candle_endpoint_family_subtotals == {
+        "/fapi/v1/klines": 5,
+        "/fapi/v1/markPriceKlines": 5,
+        "/fapi/v1/indexPriceKlines": 5,
+        "/fapi/v1/premiumIndexKlines": 5,
+    }
+    assert weight_record.binance_candle_endpoint_family_count == 4
+    assert weight_record.binance_candle_grand_total_estimated_weight == 20
+    assert weight_record.binance_futures_request_weight_limit_1m == 2400
+    assert weight_record.binance_candle_estimated_remaining_weight_1m == 2380
+    assert weight_record.binance_candle_estimated_weight_pct_1m == 0.833333
     payload = response.json()
     assert sorted(calls) == sorted(
         [
@@ -1222,7 +1253,10 @@ def test_api_endpoint_reuses_cached_native_candle_response_for_same_request(tmp_
     assert native_calls == [("ETHUSDT", "5m", 2)]
     assert first.json()["data"]["5m"] == second.json()["data"]["5m"]
     assert first.json()["timeframe_metadata"]["5m"]["fetch_mode"] == "direct_tf"
+    assert first.json()["timeframe_metadata"]["5m"]["served_from_cache"] is False
     assert second.json()["timeframe_metadata"]["5m"]["fetch_mode"] == "direct_tf"
+    assert second.json()["timeframe_metadata"]["5m"]["served_from_cache"] is True
+    assert second.json()["timeframe_metadata"]["5m"]["cache_hit_type"] == "exact"
 
 
 def test_service_extends_cached_native_candle_window_with_only_missing_bars(tmp_path: Path) -> None:
@@ -1289,6 +1323,9 @@ def test_service_extends_cached_native_candle_window_with_only_missing_bars(tmp_
 
     assert first.frame.height == 2
     assert second.frame.height == 5
+    assert first.metadata["served_from_cache"] is False
+    assert second.metadata["served_from_cache"] is True
+    assert second.metadata["cache_hit_type"] == "partial_extended"
     assert [call[:3] for call in native_calls] == [
         ("ETHUSDT", "5m", 2),
         ("ETHUSDT", "5m", 3),

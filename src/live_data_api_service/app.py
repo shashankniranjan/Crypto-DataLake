@@ -8,14 +8,15 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 
 from binance_minute_lake.core.binance_usage import binance_usage_scope
 from binance_minute_lake.core.config import Settings
+from binance_minute_lake.core.logging import configure_logging
 from binance_minute_lake.sources.rest import BinanceRESTClient
 from binance_minute_lake.sources.websocket import InMemoryLiveCollector, LiveEventStore
 from binance_minute_lake.state.store import SQLiteStateStore
 from live_indicators.service import build_indicator_payload
 
 from .capabilities import FetchPlannerConfig
-from .parallel_provider import ParallelLiveBinanceProvider
 from .config import ApiServiceSettings
+from .parallel_provider import ParallelLiveBinanceProvider
 from .repository import HigherTimeframeRepository, MinuteLakeRepository
 from .service import LiveDataApiService
 from .timeframes import normalize_symbol
@@ -24,8 +25,17 @@ from .ws_manager import get_ws_manager
 LOGGER = logging.getLogger(__name__)
 
 
+def _configure_app_logging(level: str) -> None:
+    if not logging.getLogger().handlers:
+        configure_logging(level)
+    resolved_level = getattr(logging, level.upper(), logging.INFO)
+    logging.getLogger("live_data_api_service").setLevel(resolved_level)
+    logging.getLogger("binance_minute_lake").setLevel(resolved_level)
+
+
 def _default_service() -> LiveDataApiService:
     lake_settings = Settings()
+    _configure_app_logging(lake_settings.log_level)
     api_settings = ApiServiceSettings()
 
     repository = MinuteLakeRepository(lake_settings.root_dir)

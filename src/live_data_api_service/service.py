@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import inspect
 import logging
-from collections import OrderedDict
-from collections.abc import Callable, Iterable
+from collections import Counter, OrderedDict
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
@@ -14,7 +14,11 @@ from typing import Any, cast
 
 import polars as pl
 
-from binance_minute_lake.core.binance_usage import record_binance_cache_event
+from binance_minute_lake.core.binance_usage import (
+    BINANCE_FUTURES_REQUEST_WEIGHT_LIMIT_1M,
+    binance_futures_kline_request_weight,
+    record_binance_cache_event,
+)
 from binance_minute_lake.state.store import SQLiteStateStore
 
 from .aggregation import aggregate_canonical_frame
@@ -41,6 +45,7 @@ from .utils import (
 
 LOGGER = logging.getLogger(__name__)
 AUXILIARY_FETCH_EXTRA_ROWS = 5
+BINANCE_KLINE_PAGE_LIMIT = 1500
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +76,38 @@ class _TimeframeCacheKey:
 class _TimeframeCacheEntry:
     result: TimeframeCandleResult
     expires_at_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class _NativeCandleEndpointFamily:
+    method_name: str
+    endpoint: str
+    limit_extra_rows: int = 0
+    paginated: bool = False
+
+
+_NATIVE_CANDLE_ENDPOINT_FAMILIES = (
+    _NativeCandleEndpointFamily(
+        method_name="fetch_native_candles",
+        endpoint="/fapi/v1/klines",
+        paginated=True,
+    ),
+    _NativeCandleEndpointFamily(
+        method_name="fetch_native_mark_price_klines",
+        endpoint="/fapi/v1/markPriceKlines",
+        limit_extra_rows=AUXILIARY_FETCH_EXTRA_ROWS,
+    ),
+    _NativeCandleEndpointFamily(
+        method_name="fetch_native_index_price_klines",
+        endpoint="/fapi/v1/indexPriceKlines",
+        limit_extra_rows=AUXILIARY_FETCH_EXTRA_ROWS,
+    ),
+    _NativeCandleEndpointFamily(
+        method_name="fetch_native_premium_index_klines",
+        endpoint="/fapi/v1/premiumIndexKlines",
+        limit_extra_rows=AUXILIARY_FETCH_EXTRA_ROWS,
+    ),
+)
 
 
 class LiveDataApiService:
@@ -196,8 +233,14 @@ class LiveDataApiService:
         result: TimeframeCandleResult,
         *,
         latency_secs: float | None = None,
+        served_from_cache: bool | None = None,
+        cache_hit_type: str | None = None,
     ) -> TimeframeCandleResult:
         metadata = dict(result.metadata)
+        if served_from_cache is not None:
+            metadata["served_from_cache"] = served_from_cache
+        if cache_hit_type is not None:
+            metadata["cache_hit_type"] = cache_hit_type
         if latency_secs is not None:
             metadata["latency_secs"] = latency_secs
         return TimeframeCandleResult(frame=result.frame.clone(), metadata=metadata)
@@ -249,6 +292,8 @@ class LiveDataApiService:
         return self._clone_timeframe_result(
             entry.result,
             latency_secs=round(max(perf_counter() - started_at, 0.0), 6),
+            served_from_cache=True,
+            cache_hit_type="exact",
         )
 
     def _matching_cached_timeframe_results(
@@ -303,6 +348,8 @@ class LiveDataApiService:
         notes = metadata.get("notes")
         if isinstance(notes, list):
             metadata["notes"] = _clean_metadata_notes([*notes, "served_from_timeframe_cache_superset"])
+        metadata["served_from_cache"] = True
+        metadata["cache_hit_type"] = "superset"
         metadata["latency_secs"] = round(max(perf_counter() - started_at, 0.0), 6)
         return TimeframeCandleResult(
             frame=best_entry.result.frame.sort("timestamp").tail(limit).clone(),
@@ -333,6 +380,8 @@ class LiveDataApiService:
         best_key, best_entry = max(candidates, key=lambda item: item[0].limit)
         record_binance_cache_event("timeframe_cache_hit_partial")
         metadata = dict(best_entry.result.metadata)
+        metadata["served_from_cache"] = True
+        metadata["cache_hit_type"] = "partial"
         metadata["latency_secs"] = round(max(perf_counter() - started_at, 0.0), 6)
         return TimeframeCandleResult(
             frame=best_entry.result.frame.sort("timestamp").tail(best_key.limit).clone(),
@@ -1100,6 +1149,7 @@ class LiveDataApiService:
                 "local_minute_lake_used": "local" in window.source,
                 "live_ws_overlay_used": window.live_overlay_used,
                 "binance_interval": binance_interval,
+                "served_from_cache": False,
                 "notes": _clean_metadata_notes(notes),
                 "latency_secs": elapsed,
             },
@@ -1133,6 +1183,7 @@ class LiveDataApiService:
                 "local_higher_timeframe_lake_used": source_strategy == "local_higher_timeframe_lake",
                 "live_ws_overlay_used": live_overlay_used,
                 "binance_interval": None,
+                "served_from_cache": False,
                 "notes": _clean_metadata_notes(notes),
                 "latency_secs": round(max(perf_counter() - started_at, 0.0), 6),
             },
@@ -1349,6 +1400,8 @@ class LiveDataApiService:
                                     cached_partial.metadata.get("fallback_used")
                                     or missing_result.metadata.get("fallback_used")
                                 ),
+                                "served_from_cache": True,
+                                "cache_hit_type": "partial_extended",
                                 "notes": _clean_metadata_notes(
                                     [
                                         *(missing_notes if isinstance(missing_notes, list) else []),
@@ -1403,6 +1456,7 @@ class LiveDataApiService:
                         "fetch_mode": decision.fetch_mode,
                         "fallback_used": False,
                         "binance_interval": decision.binance_interval,
+                        "served_from_cache": False,
                         "notes": _clean_metadata_notes(notes),
                         "latency_secs": elapsed,
                     },
@@ -1454,6 +1508,7 @@ class LiveDataApiService:
                     "fetch_mode": "aggregate_from_1m",
                     "fallback_used": True,
                     "binance_interval": decision.binance_interval,
+                    "served_from_cache": False,
                     "notes": _clean_metadata_notes(notes),
                     "latency_secs": elapsed,
                 },
@@ -1469,6 +1524,7 @@ class LiveDataApiService:
                 "fetch_mode": "unavailable",
                 "fallback_used": False,
                 "binance_interval": decision.binance_interval,
+                "served_from_cache": False,
                 "notes": _clean_metadata_notes(notes),
                 "latency_secs": round(max(perf_counter() - started_at, 0.0), 6),
             },
@@ -1495,11 +1551,19 @@ class LiveDataApiService:
             if effective_limit < 1 or effective_limit > self._max_limit:
                 raise ValueError(f"limit for {api_name} must be between 1 and {self._max_limit}")
 
+        symbol = normalize_symbol(coin)
         resolved_end = self.resolve_end_time(coin=coin, end_time=end_time)
         plan = {
             request.api_name: plan_timeframe_fetch(request.spec, self._fetch_planner_config)
             for request in timeframe_requests
         }
+        candle_weight_estimate = _estimate_perpetual_data_native_candle_weight(
+            provider=self._provider,
+            timeframe_requests=timeframe_requests,
+            effective_limits=effective_limits,
+            plan=plan,
+            native_candle_calls_enabled=not self._is_local_only_btc_symbol(symbol),
+        )
         LOGGER.info(
             "Perpetual data fetch plan selected",
             extra={
@@ -1513,6 +1577,38 @@ class LiveDataApiService:
                     }
                     for name, decision in plan.items()
                 },
+            },
+        )
+        LOGGER.info(
+            (
+                "Perpetual data Binance candle REST weight estimate: "
+                "parsed_limits=%s per_timeframe=%s endpoint_subtotals=%s grand_total=%s "
+                "max_allowed_1m=%s estimated_remaining_1m=%s estimated_pct_1m=%s endpoint_family_count=%s"
+            ),
+            candle_weight_estimate["parsed_timeframe_limits"],
+            candle_weight_estimate["per_timeframe_weight"],
+            candle_weight_estimate["endpoint_family_subtotals"],
+            candle_weight_estimate["grand_total_estimated_weight"],
+            candle_weight_estimate["max_allowed_weight_1m"],
+            candle_weight_estimate["estimated_remaining_weight_1m"],
+            candle_weight_estimate["estimated_weight_pct_1m"],
+            candle_weight_estimate["endpoint_family_count"],
+            extra={
+                "coin": coin,
+                "parsed_timeframe_limits": candle_weight_estimate["parsed_timeframe_limits"],
+                "binance_candle_weight_per_timeframe": candle_weight_estimate["per_timeframe"],
+                "binance_candle_weight_per_timeframe_total": candle_weight_estimate["per_timeframe_weight"],
+                "binance_candle_endpoint_family_subtotals": candle_weight_estimate["endpoint_family_subtotals"],
+                "binance_candle_endpoint_families": candle_weight_estimate["endpoint_families"],
+                "binance_candle_endpoint_family_count": candle_weight_estimate["endpoint_family_count"],
+                "binance_candle_grand_total_estimated_weight": candle_weight_estimate[
+                    "grand_total_estimated_weight"
+                ],
+                "binance_futures_request_weight_limit_1m": candle_weight_estimate["max_allowed_weight_1m"],
+                "binance_candle_estimated_remaining_weight_1m": candle_weight_estimate[
+                    "estimated_remaining_weight_1m"
+                ],
+                "binance_candle_estimated_weight_pct_1m": candle_weight_estimate["estimated_weight_pct_1m"],
             },
         )
 
@@ -1537,7 +1633,7 @@ class LiveDataApiService:
         payload = {name: rows for name, (rows, _) in fetched.items()}
         timeframe_metadata = {name: metadata for name, (_, metadata) in fetched.items()}
         return {
-            "symbol": normalize_symbol(coin),
+            "symbol": symbol,
             "timeframes": [request.api_name for request in timeframe_requests],
             "limit": resolved_limit,
             "limits": effective_limits,
@@ -1549,6 +1645,89 @@ class LiveDataApiService:
             "capabilities": response_capability_matrix(),
             "data": payload,
         }
+
+
+def _active_native_candle_endpoint_families(provider: object) -> tuple[_NativeCandleEndpointFamily, ...]:
+    active_families = tuple(
+        family for family in _NATIVE_CANDLE_ENDPOINT_FAMILIES if callable(getattr(provider, family.method_name, None))
+    )
+    if not any(family.method_name == "fetch_native_candles" for family in active_families):
+        return ()
+    return active_families
+
+
+def _estimate_paginated_kline_weight(limit: int, *, page_limit: int = BINANCE_KLINE_PAGE_LIMIT) -> tuple[int, int, int]:
+    sanitized_limit = max(limit, 1)
+    sanitized_page_limit = max(page_limit, 1)
+    pages = max((sanitized_limit + sanitized_page_limit - 1) // sanitized_page_limit, 1)
+    request_limit = min(sanitized_limit, sanitized_page_limit)
+    return pages * binance_futures_kline_request_weight(request_limit), pages, request_limit
+
+
+def _estimate_perpetual_data_native_candle_weight(
+    *,
+    provider: object,
+    timeframe_requests: Iterable[Any],
+    effective_limits: Mapping[str, int],
+    plan: Mapping[str, Any],
+    native_candle_calls_enabled: bool = True,
+) -> dict[str, object]:
+    endpoint_families = _active_native_candle_endpoint_families(provider) if native_candle_calls_enabled else ()
+    endpoint_subtotals: Counter[str] = Counter()
+    per_timeframe: dict[str, dict[str, object]] = {}
+    per_timeframe_weight: dict[str, int] = {}
+
+    for request in timeframe_requests:
+        api_name = request.api_name
+        decision = plan[api_name]
+        requested_limit = effective_limits[api_name]
+        timeframe_total = 0
+        family_details: dict[str, dict[str, object]] = {}
+
+        if decision.fetch_mode == "direct_tf" and decision.binance_interval is not None:
+            for family in endpoint_families:
+                family_limit = requested_limit + family.limit_extra_rows
+                if family.paginated:
+                    estimated_weight, pages, request_limit = _estimate_paginated_kline_weight(family_limit)
+                else:
+                    request_limit = min(max(family_limit, 1), BINANCE_KLINE_PAGE_LIMIT)
+                    estimated_weight = binance_futures_kline_request_weight(request_limit)
+                    pages = 1
+                timeframe_total += estimated_weight
+                endpoint_subtotals[family.endpoint] += estimated_weight
+                family_details[family.endpoint] = {
+                    "request_limit": request_limit,
+                    "pages": pages,
+                    "estimated_weight": estimated_weight,
+                }
+
+        per_timeframe_weight[api_name] = timeframe_total
+        per_timeframe[api_name] = {
+            "parsed_limit": requested_limit,
+            "binance_interval": decision.binance_interval,
+            "fetch_mode": decision.fetch_mode,
+            "estimated_weight": timeframe_total,
+            "endpoint_families": family_details,
+        }
+
+    return {
+        "parsed_timeframe_limits": dict(effective_limits),
+        "endpoint_families": [family.endpoint for family in endpoint_families],
+        "endpoint_family_count": len(endpoint_families),
+        "per_timeframe": per_timeframe,
+        "per_timeframe_weight": per_timeframe_weight,
+        "endpoint_family_subtotals": dict(endpoint_subtotals),
+        "grand_total_estimated_weight": sum(endpoint_subtotals.values()),
+        "max_allowed_weight_1m": BINANCE_FUTURES_REQUEST_WEIGHT_LIMIT_1M,
+        "estimated_remaining_weight_1m": max(
+            BINANCE_FUTURES_REQUEST_WEIGHT_LIMIT_1M - sum(endpoint_subtotals.values()),
+            0,
+        ),
+        "estimated_weight_pct_1m": round(
+            (sum(endpoint_subtotals.values()) / BINANCE_FUTURES_REQUEST_WEIGHT_LIMIT_1M) * 100,
+            6,
+        ),
+    }
 
 
 def _populated_count(frame: pl.DataFrame, columns: list[str]) -> int:

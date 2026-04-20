@@ -3,8 +3,18 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from binance_minute_lake.core.binance_usage import binance_usage_scope
+from binance_minute_lake.core.binance_usage import binance_futures_kline_request_weight, binance_usage_scope
 from binance_minute_lake.sources.rest import BinanceRESTClient
+
+
+def test_binance_futures_kline_request_weight_breakpoints() -> None:
+    assert binance_futures_kline_request_weight(1) == 1
+    assert binance_futures_kline_request_weight(99) == 1
+    assert binance_futures_kline_request_weight(100) == 2
+    assert binance_futures_kline_request_weight(499) == 2
+    assert binance_futures_kline_request_weight(500) == 5
+    assert binance_futures_kline_request_weight(1000) == 5
+    assert binance_futures_kline_request_weight(1001) == 10
 
 
 def test_rest_client_retries_on_429_then_succeeds() -> None:
@@ -212,4 +222,54 @@ def test_rest_client_tracks_used_weight_headers_in_usage_scope() -> None:
             "max": 17,
             "delta_after_first": 0,
         }
+    }
+
+
+def test_rest_client_estimates_candle_family_request_weight_in_usage_scope() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code=200, request=request, json=[])
+
+    client = BinanceRESTClient(
+        base_url="https://fapi.binance.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with binance_usage_scope("/api/v1/perpetual-data") as usage_tracker:
+            client.fetch_klines(
+                "BTCUSDT",
+                datetime(2025, 1, 1, tzinfo=UTC),
+                datetime(2025, 1, 1, 1, tzinfo=UTC),
+                limit=99,
+            )
+            client.fetch_mark_price_klines(
+                "BTCUSDT",
+                datetime(2025, 1, 1, tzinfo=UTC),
+                datetime(2025, 1, 1, 1, tzinfo=UTC),
+                limit=100,
+            )
+            client.fetch_index_price_klines(
+                "BTCUSDT",
+                datetime(2025, 1, 1, tzinfo=UTC),
+                datetime(2025, 1, 1, 1, tzinfo=UTC),
+                limit=500,
+            )
+            client.fetch_premium_index_klines(
+                "BTCUSDT",
+                datetime(2025, 1, 1, tzinfo=UTC),
+                datetime(2025, 1, 1, 1, tzinfo=UTC),
+                limit=1001,
+            )
+    finally:
+        client.close()
+
+    fields = usage_tracker.as_log_fields()
+    assert fields["binance_estimated_kline_weight_total"] == 18
+    assert fields["binance_futures_request_weight_limit_1m"] == 2400
+    assert fields["binance_estimated_kline_weight_remaining_1m"] == 2382
+    assert fields["binance_estimated_kline_weight_pct_1m"] == 0.75
+    assert fields["binance_estimated_kline_weight_by_endpoint"] == {
+        "/fapi/v1/klines": 1,
+        "/fapi/v1/markPriceKlines": 2,
+        "/fapi/v1/indexPriceKlines": 5,
+        "/fapi/v1/premiumIndexKlines": 10,
     }
