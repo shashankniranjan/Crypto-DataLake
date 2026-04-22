@@ -58,6 +58,16 @@ class MinuteLakeReader:
             .sort("timestamp")
         )
 
+    def partition_directories(self, symbol: str) -> frozenset[str]:
+        root = self._symbol_root(symbol)
+        if not root.exists():
+            return frozenset()
+        return frozenset(
+            str(path.parent.relative_to(root))
+            for path in root.rglob("*.parquet")
+            if path.is_file()
+        )
+
     def _scan_symbol(self, symbol: str) -> pl.LazyFrame:
         path = self._symbol_root(symbol)
         if not path.exists():

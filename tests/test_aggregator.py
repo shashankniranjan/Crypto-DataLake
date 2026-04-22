@@ -9,7 +9,9 @@ import polars as pl
 from aggregator.aggregation_rules import aggregate_minutes
 from aggregator.backfill import BackfillRunner
 from aggregator.bucketing import parse_timeframe
+from aggregator.config import AggregatorSettings
 from aggregator.incremental import IncrementalRunner
+from aggregator.main import AggregationService
 from aggregator.source_reader import MinuteLakeReader
 from aggregator.state_store import AggregatorStateStore
 from aggregator.target_writer import HigherTimeframeWriter
@@ -223,6 +225,48 @@ def test_idempotent_rewrites_do_not_duplicate_rows(tmp_path: Path) -> None:
 
     written = _scan_target(tmp_path / "htf")
     assert written.height == 1
+
+
+def test_live_iteration_backfills_new_historical_partition_directory(tmp_path: Path) -> None:
+    symbol = "BTCUSDT"
+    first_start = datetime(2026, 1, 2, 0, 0, tzinfo=UTC)
+    historical_start = datetime(2026, 1, 1, 0, 0, tzinfo=UTC)
+    _write_minute_partitions(
+        tmp_path,
+        symbol,
+        [_minute_row(first_start + timedelta(minutes=offset)) for offset in range(5)],
+    )
+
+    settings = AggregatorSettings(
+        symbol=symbol,
+        source_root=tmp_path,
+        target_root=tmp_path / "htf",
+        state_db=tmp_path / "state.sqlite",
+        timeframes=("5m",),
+    )
+    store = AggregatorStateStore(settings.state_db)
+    service = AggregationService(
+        settings=settings,
+        reader=MinuteLakeReader(settings.minute_lake_root),
+        writer=HigherTimeframeWriter(settings.target_root),
+        state_store=store,
+    )
+    store.initialize()
+
+    service.run_startup()
+    written = _scan_target(tmp_path / "htf")
+    assert written.get_column("bucket_start").to_list() == [first_start]
+
+    _write_minute_partitions(
+        tmp_path,
+        symbol,
+        [_minute_row(historical_start + timedelta(minutes=offset)) for offset in range(5)],
+    )
+
+    service.run_live_iteration()
+
+    written = _scan_target(tmp_path / "htf")
+    assert written.get_column("bucket_start").to_list() == [historical_start, first_start]
 
 
 def test_ohlc_correctness() -> None:

@@ -19,6 +19,14 @@ from .utils import empty_canonical_frame
 
 LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
+_VISION_CANONICAL_STREAMS = (
+    "klines",
+    "markPriceKlines",
+    "indexPriceKlines",
+    "aggTrades",
+    "bookTicker",
+    "metrics",
+)
 
 
 class BinanceCanonicalMinuteProvider:
@@ -390,6 +398,14 @@ class BinanceCanonicalMinuteProvider:
 
     def fetch_native_premium_index_snapshot(self, symbol: str) -> dict[str, object]:
         return self._rest.fetch_premium_index(symbol)
+
+    def delete_cached_vision_files(self, symbol: str, start_time: datetime, end_time: datetime) -> int:
+        return self._vision_loader.delete_cached_files(
+            symbol,
+            floor_to_minute(start_time.astimezone(UTC)),
+            floor_to_minute(end_time.astimezone(UTC)),
+            streams=_VISION_CANONICAL_STREAMS,
+        )
 
     @staticmethod
     def _collect_live_features(

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .capabilities import CandleFetchMode
@@ -38,6 +37,8 @@ class ApiServiceSettings(BaseSettings):
     local_preferred_symbols: str = Field(default="BTCUSDT")
     local_symbol_require_full_coverage: bool = Field(default=False)
     local_symbol_allow_binance_patch: bool = Field(default=True)
+    btc_allow_binance_patch: bool = Field(default=True)
+    persist_binance_patches: bool = Field(default=True)
     enable_btc_complexity_guard: bool = Field(default=True)
     btc_local_max_1m_bars: int = Field(default=500, ge=1)
     btc_local_max_3m_bars: int = Field(default=300, ge=1)

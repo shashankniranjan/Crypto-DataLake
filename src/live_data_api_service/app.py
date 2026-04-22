@@ -39,10 +39,15 @@ def _default_service() -> LiveDataApiService:
     api_settings = ApiServiceSettings()
 
     repository = MinuteLakeRepository(lake_settings.root_dir)
+    canonical_cache_root = lake_settings.root_dir.parent / ".cache" / "canonical_lake"
+    canonical_cache_repository = MinuteLakeRepository(canonical_cache_root)
+    canonical_cache_state_store = SQLiteStateStore(canonical_cache_root / "state.sqlite")
+    canonical_cache_state_store.initialize()
     higher_timeframe_repository = HigherTimeframeRepository(
         lake_settings.root_dir / "futures" / "um" / "higher_timeframes"
     )
-    state_store = SQLiteStateStore(lake_settings.state_db) if lake_settings.state_db.exists() else None
+    state_store = SQLiteStateStore(lake_settings.state_db)
+    state_store.initialize()
     shared_live_symbol = normalize_symbol(api_settings.shared_live_symbol or lake_settings.symbol)
     shared_live_event_db = (
         api_settings.shared_live_event_db
@@ -109,6 +114,8 @@ def _default_service() -> LiveDataApiService:
         local_preferred_symbols=api_settings.local_preferred_symbols.split(","),
         local_symbol_require_full_coverage=api_settings.local_symbol_require_full_coverage,
         local_symbol_allow_binance_patch=api_settings.local_symbol_allow_binance_patch,
+        btc_allow_binance_patch=api_settings.btc_allow_binance_patch,
+        persist_binance_patches=api_settings.persist_binance_patches,
         enable_btc_complexity_guard=api_settings.enable_btc_complexity_guard,
         btc_local_max_1m_bars=api_settings.btc_local_max_1m_bars,
         btc_local_max_3m_bars=api_settings.btc_local_max_3m_bars,
@@ -120,6 +127,8 @@ def _default_service() -> LiveDataApiService:
             allow_legacy_1m_fallback=api_settings.allow_legacy_1m_fallback,
             allow_partial_response_with_notes=api_settings.allow_partial_response_with_notes,
         ),
+        canonical_cache_repository=canonical_cache_repository,
+        canonical_cache_state_store=canonical_cache_state_store,
     )
 
 

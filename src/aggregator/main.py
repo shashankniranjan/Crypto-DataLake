@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .backfill import BackfillResult, BackfillRunner
 from .bucketing import TimeframeSpec, parse_timeframe
@@ -21,12 +21,13 @@ def _configure_logging(level: str) -> None:
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class AggregationService:
     settings: AggregatorSettings
     reader: MinuteLakeReader
     writer: HigherTimeframeWriter
     state_store: AggregatorStateStore
+    _source_partition_snapshot: frozenset[str] | None = field(default=None, init=False, repr=False)
 
     @classmethod
     def from_settings(cls, settings: AggregatorSettings | None = None) -> AggregationService:
@@ -58,6 +59,7 @@ class AggregationService:
         results: dict[str, BackfillResult] = {}
         for spec in self._timeframe_specs():
             results[spec.name] = runner.run_for_timeframe(self.settings.symbol, spec)
+        self._refresh_source_partition_snapshot()
         return results
 
     def run_continuous_once(self) -> dict[str, IncrementalResult]:
@@ -73,6 +75,15 @@ class AggregationService:
             results[spec.name] = runner.run_once(self.settings.symbol, spec)
         return results
 
+    def run_live_iteration(self) -> dict[str, BackfillResult] | dict[str, IncrementalResult]:
+        if self._source_partition_change_detected():
+            logging.getLogger(__name__).info(
+                "running startup backfill after source minute partition change symbol=%s",
+                self.settings.symbol,
+            )
+            return self.run_startup()
+        return self.run_continuous_once()
+
     def run_forever(self) -> None:
         self.run_startup()
         logger = logging.getLogger(__name__)
@@ -82,11 +93,48 @@ class AggregationService:
             self.settings.poll_interval_seconds,
         )
         while True:
-            self.run_continuous_once()
+            self.run_live_iteration()
             time.sleep(self.settings.poll_interval_seconds)
 
     def _timeframe_specs(self) -> list[TimeframeSpec]:
         return [parse_timeframe(value) for value in self.settings.timeframes]
+
+    def _refresh_source_partition_snapshot(self) -> None:
+        if not self.settings.detect_source_partition_changes:
+            return
+        self._source_partition_snapshot = self.reader.partition_directories(self.settings.symbol)
+
+    def _source_partition_change_detected(self) -> bool:
+        if not self.settings.detect_source_partition_changes:
+            return False
+
+        current = self.reader.partition_directories(self.settings.symbol)
+        if self._source_partition_snapshot is None:
+            self._source_partition_snapshot = current
+            return False
+
+        added = current - self._source_partition_snapshot
+        removed = self._source_partition_snapshot - current
+        if removed:
+            logging.getLogger(__name__).warning(
+                "source minute partition directories disappeared symbol=%s removed_count=%s",
+                self.settings.symbol,
+                len(removed),
+            )
+
+        if not added:
+            self._source_partition_snapshot = current
+            return False
+
+        sample = ", ".join(sorted(added)[:5])
+        logging.getLogger(__name__).info(
+            "source minute partition directories added symbol=%s added_count=%s sample=%s",
+            self.settings.symbol,
+            len(added),
+            sample,
+        )
+        self._source_partition_snapshot = current
+        return True
 
 
 def run() -> None:

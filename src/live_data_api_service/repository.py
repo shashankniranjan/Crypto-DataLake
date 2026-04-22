@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
 
 import polars as pl
 
@@ -13,6 +14,10 @@ from .utils import cast_canonical_frame, empty_canonical_frame
 class MinuteLakeRepository:
     def __init__(self, root_dir: Path) -> None:
         self._root_dir = root_dir
+
+    @property
+    def root_dir(self) -> Path:
+        return self._root_dir
 
     def load_canonical_minutes(self, symbol: str, start_time: datetime, end_time: datetime) -> pl.DataFrame:
         partition_paths = [
@@ -48,7 +53,7 @@ class MinuteLakeRepository:
 
 
 class HigherTimeframeRepository:
-    _TIMEFRAME_ALIASES = {
+    _TIMEFRAME_ALIASES: ClassVar[dict[str, str]] = {
         "1h": "1h",
         "1hr": "1h",
         "4h": "4h",

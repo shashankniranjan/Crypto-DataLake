@@ -23,6 +23,13 @@ Env:
   BML_API_DEFAULT_LIMIT          Default response bar limit
   BML_API_MAX_LIMIT              Maximum allowed response bar limit
   BML_API_ON_DEMAND_MAX_MINUTES  Max minute span allowed for Binance fallback
+  BML_API_BTC_ALLOW_BINANCE_PATCH
+                                 When true (default), BTC missing local
+                                 minutes are rebuilt from Binance.
+  BML_API_PERSIST_BINANCE_PATCHES
+                                 When true (default), on-demand Binance
+                                 canonical minute patches are written back
+                                 to the local minute lake.
   BML_API_WS_SYMBOLS             Comma-separated symbols to subscribe on startup
                                  e.g. "BTC,ETH,GIGGLE" (USDT perp implied)
                                  Subscriptions start immediately; no need to

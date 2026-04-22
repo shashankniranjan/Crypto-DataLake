@@ -239,6 +239,7 @@ State and checkpoints are stored separately in:
 
 - Startup runs backfill first, detects missing complete HTF buckets from minute history, writes only those buckets, then enters continuous polling mode.
 - Continuous mode only recomputes newly completable buckets plus a recent repair lookback window so late minute arrivals or duplicate-minute corrections can rewrite recent HTF buckets idempotently.
+- Continuous mode also watches the source minute-lake partition directories. When new historical or current hour directories appear after startup, it automatically runs the startup backfill pass again so older additions are materialized without restarting the service.
 - Incomplete buckets are skipped by default and are only materialized when `HTF_ALLOW_INCOMPLETE_BUCKETS=true`.
 - Weekly buckets are aligned to Monday `00:00 UTC`; monthly buckets are aligned to the first day of month `00:00 UTC`.
 
@@ -266,6 +267,7 @@ Optional environment variables:
 - `HTF_STATE_DB=./state/aggregator_state.sqlite`
 - `HTF_POLL_INTERVAL_SECONDS=30`
 - `HTF_REPAIR_LOOKBACK_MINUTES=120`
+- `HTF_DETECT_SOURCE_PARTITION_CHANGES=true`
 - `HTF_ALLOW_INCOMPLETE_BUCKETS=false`
 - `HTF_TIMEFRAMES=3m,5m,10m,15m,30m,45m,1h,4h,8h,1d,1w,1M`
 - `TAIL_LINES=20`
@@ -328,15 +330,13 @@ Config flags use the `BML_API_` prefix:
 - `BML_API_LOCAL_PREFERRED_SYMBOLS=BTCUSDT` is a comma-separated list of symbols that should prefer local 1m parquet plus live WS overlay before native Binance timeframe candles.
 - `BML_API_LOCAL_SYMBOL_REQUIRE_FULL_COVERAGE=false` falls back when the local minute lake cannot fully satisfy the requested aggregation window.
 - `BML_API_LOCAL_SYMBOL_ALLOW_BINANCE_PATCH=true` allows the existing canonical 1m Binance rebuild path to patch missing local minutes before aggregation.
-- `BML_API_ENABLE_BTC_COMPLEXITY_GUARD=true` prevents oversized BTC requests from forcing expensive local 1m aggregation.
-- `BML_API_BTC_LOCAL_MAX_1M_BARS=500` and `BML_API_BTC_LOCAL_MAX_3M_BARS=300` bound BTC local-path bar counts for low timeframes.
-- `BML_API_BTC_LOCAL_MAX_HIGHER_TF_BARS=200` bounds BTC local-path requests for timeframes above `3m`.
-- `BML_API_BTC_FORCE_BINANCE_FOR_HEAVY_HIGHER_TF=true` sends BTC `5m+` requests above the threshold to Binance-native timeframe fetch.
+- `BML_API_BTC_ALLOW_BINANCE_PATCH=true` allows BTC to use the canonical 1m Binance rebuild path when local minute coverage is missing. Set it to `false` to restore strict local-only BTC serving.
+- `BML_API_PERSIST_BINANCE_PATCHES=true` writes on-demand canonical Binance patch rows back into the local minute lake through the atomic partition writer, so later requests can read them locally.
 
 Source routing:
 
-- Symbols in `BML_API_LOCAL_PREFERRED_SYMBOLS` use the local 1m minute lake first. If local coverage can satisfy the requested bars and the BTC complexity guard allows the timeframe, the API aggregates locally and overlays live WS snapshots when available. Metadata includes `source_strategy=local_minute_lake_preferred`, `local_minute_lake_used`, `live_ws_overlay_used`, and notes such as `using_local_btc_minute_lake`, `btc_local_path_selected`, or `using_live_ws_overlay`.
-- BTC requests can split by timeframe: `1m`/`3m` stay local while heavy `5m+` timeframes use Binance-native candles. Heavy fallback metadata includes `btc_local_path_skipped_due_to_request_complexity`, `btc_higher_tf_binance_fallback`, and `btc_mixed_source_plan`.
+- Symbols in `BML_API_LOCAL_PREFERRED_SYMBOLS` use the local 1m minute lake first. If local coverage can satisfy the requested bars, the API aggregates locally and overlays live WS snapshots when available. Metadata includes `source_strategy=local_minute_lake_preferred`, `local_minute_lake_used`, `live_ws_overlay_used`, and notes such as `using_local_btc_minute_lake`, `btc_local_path_selected`, or `using_live_ws_overlay`.
+- BTC requests above `3m` first try the local higher-timeframe lake, then fall back to local 1m aggregation. If the required 1m rows are missing and `BML_API_BTC_ALLOW_BINANCE_PATCH=true`, the API rebuilds those canonical minutes from Binance and persists them when `BML_API_PERSIST_BINANCE_PATCHES=true`.
 - If a local-preferred symbol lacks sufficient local coverage, the API either patches missing canonical 1m rows through the existing Binance rebuild path or falls back to the native Binance timeframe planner. Metadata notes include `local_btc_missing_required_window`, `local_btc_coverage_incomplete_patched_from_binance`, or `local_btc_coverage_incomplete_fallback_to_binance` as applicable.
 - Symbols not in `BML_API_LOCAL_PREFERRED_SYMBOLS` keep the efficiency-first path: native Binance timeframe candles plus REST enrichment for OI, long/short ratios, mark/index/premium bars, and funding alignment.
 

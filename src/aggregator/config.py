@@ -20,6 +20,7 @@ class AggregatorSettings(BaseSettings):
     poll_interval_seconds: int = Field(default=30, ge=1)
     repair_lookback_minutes: int = Field(default=120, ge=1)
     allow_incomplete_buckets: bool = Field(default=False)
+    detect_source_partition_changes: bool = Field(default=True)
     log_level: str = Field(default="INFO")
 
     model_config = SettingsConfigDict(

@@ -218,6 +218,30 @@ class VisionLoader:
             yield day
             day = day + timedelta(days=1)
 
+    def delete_cached_files(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        streams: Iterable[str],
+        interval: str = "1m",
+    ) -> int:
+        """Delete cached ZIP files for a materialized window.
+
+        Missing markers are intentionally preserved; they are small and keep
+        repeated API misses from probing Binance Vision too aggressively.
+        """
+        removed = 0
+        for stream in streams:
+            stream_interval = interval if VisionClient.requires_interval(stream) else "1m"
+            for day in self._days_in_window(start, end):
+                path = self._cache_path(stream, symbol, day, stream_interval)
+                if path.exists() and path.suffix == ".zip":
+                    path.unlink()
+                    removed += 1
+        return removed
+
     def _filter_and_export(
         self,
         frames: list[pl.DataFrame],

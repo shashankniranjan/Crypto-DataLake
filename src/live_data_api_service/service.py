@@ -19,7 +19,10 @@ from binance_minute_lake.core.binance_usage import (
     binance_futures_kline_request_weight,
     record_binance_cache_event,
 )
+from binance_minute_lake.core.time_utils import iter_hours
 from binance_minute_lake.state.store import SQLiteStateStore
+from binance_minute_lake.validation.dq import DQValidator
+from binance_minute_lake.writer.atomic import AtomicParquetWriter
 
 from .aggregation import aggregate_canonical_frame
 from .alignment import AlignmentMode, align_series, normalize_bar_timestamp
@@ -106,6 +109,14 @@ class _CanonicalPatchInFlight:
     exception: BaseException | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _CanonicalMaterializationTarget:
+    repository: MinuteLakeRepository
+    writer: AtomicParquetWriter
+    lock: Lock
+    source_label: str
+
+
 @dataclass(slots=True)
 class _SnapshotCacheEntry:
     result: dict[str, object]
@@ -172,6 +183,8 @@ class LiveDataApiService:
         local_preferred_symbols: Iterable[str] | None = None,
         local_symbol_require_full_coverage: bool = False,
         local_symbol_allow_binance_patch: bool = True,
+        btc_allow_binance_patch: bool = True,
+        persist_binance_patches: bool = True,
         enable_btc_complexity_guard: bool = True,
         btc_local_max_1m_bars: int = 500,
         btc_local_max_3m_bars: int = 300,
@@ -182,6 +195,8 @@ class LiveDataApiService:
         timeframe_cache_stable_ttl_seconds: int = 21_600,
         timeframe_cache_recent_ttl_seconds: int = 15,
         canonical_patch_cache_max_entries: int = 128,
+        canonical_cache_repository: MinuteLakeRepository | None = None,
+        canonical_cache_state_store: SQLiteStateStore | None = None,
         premium_index_snapshot_cache_ttl_seconds: float = 1.0,
     ) -> None:
         self._repository = repository
@@ -206,6 +221,8 @@ class LiveDataApiService:
         )
         self._local_symbol_require_full_coverage = local_symbol_require_full_coverage
         self._local_symbol_allow_binance_patch = local_symbol_allow_binance_patch
+        self._btc_allow_binance_patch = btc_allow_binance_patch
+        self._persist_binance_patches = persist_binance_patches
         self._enable_btc_complexity_guard = enable_btc_complexity_guard
         self._btc_local_max_1m_bars = btc_local_max_1m_bars
         self._btc_local_max_3m_bars = btc_local_max_3m_bars
@@ -226,6 +243,19 @@ class LiveDataApiService:
         self._premium_index_snapshot_cache_lock = Lock()
         self._premium_index_snapshot_cache: dict[str, _SnapshotCacheEntry] = {}
         self._premium_index_snapshot_inflight: dict[str, _SnapshotInFlight] = {}
+        self._canonical_writer = (
+            AtomicParquetWriter(repository.root_dir, state_store, DQValidator())
+            if state_store is not None
+            else None
+        )
+        self._canonical_writer_lock = Lock()
+        self._canonical_cache_repository = canonical_cache_repository
+        self._canonical_cache_writer = (
+            AtomicParquetWriter(canonical_cache_repository.root_dir, canonical_cache_state_store, DQValidator())
+            if canonical_cache_repository is not None and canonical_cache_state_store is not None
+            else None
+        )
+        self._canonical_cache_writer_lock = Lock()
 
     def close(self) -> None:
         close = getattr(self._provider, "close", None)
@@ -279,6 +309,9 @@ class LiveDataApiService:
     @staticmethod
     def _is_local_only_btc_symbol(symbol: str) -> bool:
         return symbol == "BTCUSDT"
+
+    def _btc_uses_local_only_path(self, symbol: str) -> bool:
+        return self._is_local_only_btc_symbol(symbol) and not self._btc_allow_binance_patch
 
     @staticmethod
     def _clone_timeframe_result(
@@ -605,6 +638,175 @@ class LiveDataApiService:
         record_binance_cache_event("canonical_patch_cache_hit_inflight")
         return inflight.frame.clone()
 
+    def _canonical_materialization_target(self, symbol: str) -> _CanonicalMaterializationTarget | None:
+        if not self._persist_binance_patches:
+            return None
+        if symbol == "BTCUSDT":
+            if self._canonical_writer is None:
+                return None
+            return _CanonicalMaterializationTarget(
+                repository=self._repository,
+                writer=self._canonical_writer,
+                lock=self._canonical_writer_lock,
+                source_label="local",
+            )
+
+        if self._canonical_cache_repository is None or self._canonical_cache_writer is None:
+            return None
+        return _CanonicalMaterializationTarget(
+            repository=self._canonical_cache_repository,
+            writer=self._canonical_cache_writer,
+            lock=self._canonical_cache_writer_lock,
+            source_label="cache",
+        )
+
+    def _load_materialized_canonical_minutes(
+        self,
+        symbol: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> tuple[pl.DataFrame, str]:
+        local_frame = self._repository.load_canonical_minutes(symbol, start_time, end_time)
+        cache_frame = (
+            self._canonical_cache_repository.load_canonical_minutes(symbol, start_time, end_time)
+            if symbol != "BTCUSDT" and self._canonical_cache_repository is not None
+            else empty_canonical_frame()
+        )
+
+        if local_frame.height > 0 and cache_frame.height > 0:
+            return merge_canonical_frames(cache_frame, local_frame), "local+cache"
+        if local_frame.height > 0:
+            return local_frame, "local"
+        if cache_frame.height > 0:
+            return cache_frame, "cache"
+        return empty_canonical_frame(), "local"
+
+    @staticmethod
+    def _iter_materialization_windows(start_time: datetime, end_time: datetime) -> Iterable[tuple[datetime, datetime]]:
+        cursor = floor_utc_minute(start_time)
+        final = floor_utc_minute(end_time)
+        while cursor <= final:
+            day_end = cursor.astimezone(UTC).replace(hour=23, minute=59, second=0, microsecond=0)
+            chunk_end = min(day_end, final)
+            yield cursor, chunk_end
+            cursor = chunk_end + timedelta(minutes=1)
+
+    def _persist_binance_canonical_patch(
+        self,
+        *,
+        symbol: str,
+        frame: pl.DataFrame,
+        target: _CanonicalMaterializationTarget | None = None,
+    ) -> None:
+        resolved_target = target or self._canonical_materialization_target(symbol)
+        if not self._persist_binance_patches or resolved_target is None or frame.height == 0:
+            return
+
+        try:
+            canonical_frame = cast_canonical_frame(frame)
+            min_ts = canonical_frame.select(pl.col("timestamp").min()).item()
+            max_ts = canonical_frame.select(pl.col("timestamp").max()).item()
+            if not isinstance(min_ts, datetime) or not isinstance(max_ts, datetime):
+                return
+
+            written_partitions = 0
+            with resolved_target.lock:
+                existing_frame = resolved_target.repository.load_canonical_minutes(symbol, min_ts, max_ts)
+                if existing_frame.height > 0:
+                    canonical_frame = canonical_frame.join(
+                        existing_frame.select("timestamp"),
+                        on="timestamp",
+                        how="anti",
+                    )
+                    if canonical_frame.height == 0:
+                        return
+
+                for hour_start in iter_hours(min_ts, max_ts):
+                    hour_end = hour_start + timedelta(hours=1)
+                    partition_frame = canonical_frame.filter(
+                        (pl.col("timestamp") >= hour_start)
+                        & (pl.col("timestamp") < hour_end)
+                    )
+                    if partition_frame.height == 0:
+                        continue
+                    resolved_target.writer.write_hour_partition(symbol, hour_start, partition_frame)
+                    written_partitions += 1
+
+            if written_partitions:
+                LOGGER.info(
+                    "Persisted Binance canonical patch to minute lake",
+                    extra={
+                        "symbol": symbol,
+                        "rows": canonical_frame.height,
+                        "partitions": written_partitions,
+                        "min_ts": min_ts.isoformat(),
+                        "max_ts": max_ts.isoformat(),
+                        "target": resolved_target.source_label,
+                    },
+                )
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to persist Binance canonical patch to minute lake",
+                extra={"symbol": symbol, "rows": frame.height, "error": str(exc)},
+            )
+
+    def _delete_provider_vision_cache(self, symbol: str, start_time: datetime, end_time: datetime) -> None:
+        delete_cached = getattr(self._provider, "delete_cached_vision_files", None)
+        if not callable(delete_cached):
+            return
+        try:
+            removed = int(delete_cached(symbol, start_time, end_time) or 0)
+        except Exception as exc:
+            LOGGER.warning(
+                "Failed to delete materialized Binance Vision cache files",
+                extra={
+                    "symbol": symbol,
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat(),
+                    "error": str(exc),
+                },
+            )
+            return
+        if removed:
+            LOGGER.info(
+                "Deleted materialized Binance Vision cache files",
+                extra={
+                    "symbol": symbol,
+                    "start_time": start_time.isoformat(),
+                    "end_time": end_time.isoformat(),
+                    "files_removed": removed,
+                },
+            )
+
+    def _materialize_binance_canonical_patch(
+        self,
+        *,
+        symbol: str,
+        window_start: datetime,
+        resolved_end: datetime,
+        provider_kwargs: dict[str, object],
+        target: _CanonicalMaterializationTarget,
+    ) -> pl.DataFrame:
+        provider_build = cast(Any, self._provider).build_canonical_minutes
+
+        for chunk_start, chunk_end in self._iter_materialization_windows(window_start, resolved_end):
+            existing = target.repository.load_canonical_minutes(symbol, chunk_start, chunk_end)
+            if existing.height >= expected_minute_count(chunk_start, chunk_end):
+                continue
+
+            frame = cast(pl.DataFrame, provider_build(symbol, chunk_start, chunk_end, **provider_kwargs))
+            self._persist_binance_canonical_patch(symbol=symbol, frame=frame, target=target)
+            self._delete_provider_vision_cache(symbol, chunk_start, chunk_end)
+
+        frame = target.repository.load_canonical_minutes(symbol, window_start, resolved_end)
+        if symbol != "BTCUSDT" and self._repository is not target.repository:
+            primary = self._repository.load_canonical_minutes(symbol, window_start, resolved_end)
+            if primary.height > 0 and frame.height > 0:
+                return merge_canonical_frames(frame, primary)
+            if primary.height > 0:
+                return primary
+        return frame
+
     def _load_binance_canonical_patch(
         self,
         *,
@@ -619,6 +821,26 @@ class LiveDataApiService:
             end_time=resolved_end,
             live_collector_used="live_collector" in provider_kwargs,
         )
+        materialization_target = self._canonical_materialization_target(symbol)
+        if materialization_target is not None:
+            inflight, owns_fetch = self._claim_canonical_patch_fetch(key)
+            if not owns_fetch:
+                return self._wait_for_canonical_patch_fetch(inflight)
+
+            try:
+                frame = self._materialize_binance_canonical_patch(
+                    symbol=symbol,
+                    window_start=window_start,
+                    resolved_end=resolved_end,
+                    provider_kwargs=provider_kwargs,
+                    target=materialization_target,
+                )
+                self._finish_canonical_patch_fetch(key, inflight, frame=frame)
+                return frame
+            except BaseException as exc:
+                self._finish_canonical_patch_fetch(key, inflight, exception=exc)
+                raise
+
         cached = self._get_cached_canonical_patch_frame(key)
         if cached is not None:
             return cached
@@ -630,6 +852,7 @@ class LiveDataApiService:
         try:
             provider_build = cast(Any, self._provider).build_canonical_minutes
             frame = cast(pl.DataFrame, provider_build(symbol, window_start, resolved_end, **provider_kwargs))
+            self._persist_binance_canonical_patch(symbol=symbol, frame=frame)
             self._store_cached_canonical_patch_frame(key, frame=frame)
             self._finish_canonical_patch_fetch(key, inflight, frame=frame)
             return frame
@@ -825,13 +1048,12 @@ class LiveDataApiService:
             raise ValueError("end_time must be on or after start_time")
 
         symbol = normalize_symbol(coin)
-        if self._is_local_only_btc_symbol(symbol):
+        if self._btc_uses_local_only_path(symbol):
             allow_binance_patch = False
         expected_rows = expected_minute_count(window_start, resolved_end)
 
-        local_frame = self._repository.load_canonical_minutes(symbol, window_start, resolved_end)
+        local_frame, source = self._load_materialized_canonical_minutes(symbol, window_start, resolved_end)
         combined_frame = local_frame
-        source = "local"
 
         # Prefer the shared minute-lake live store for its configured symbol.
         # Other symbols only reuse an existing API-process WS collector.
@@ -860,7 +1082,7 @@ class LiveDataApiService:
             )
             if local_frame.height > 0:
                 combined_frame = merge_canonical_frames(remote_frame, local_frame)
-                source = "local+binance"
+                source = f"{source}+binance"
             else:
                 combined_frame = remote_frame
                 source = "binance"
@@ -1343,7 +1565,7 @@ class LiveDataApiService:
             return None, []
 
         note_prefix = "local_btc" if symbol == "BTCUSDT" else "local_symbol"
-        if symbol == "BTCUSDT":
+        if symbol == "BTCUSDT" and not self._btc_allow_binance_patch:
             complexity_notes = self._btc_local_complexity_notes(spec, limit)
             if complexity_notes:
                 return None, complexity_notes
@@ -1353,6 +1575,38 @@ class LiveDataApiService:
             specs=[spec],
             timeframe_limits={spec.api_name: limit},
         )
+        notes: list[str] = []
+
+        if symbol == "BTCUSDT" and spec.minutes > 3:
+            higher_tf_frame = self.load_local_higher_timeframe_window(
+                coin=coin,
+                timeframe=spec.api_name,
+                start_time=start_time,
+                end_time=resolved_end,
+            ).tail(limit)
+            if higher_tf_frame.height >= limit:
+                return self._btc_local_only_result(
+                    frame=higher_tf_frame,
+                    source="local",
+                    source_strategy="local_higher_timeframe_lake",
+                    fetch_mode="direct_local_higher_tf",
+                    notes=["using_local_btc_higher_timeframe_lake"],
+                    started_at=started_at,
+                ), []
+            if higher_tf_frame.height > 0:
+                notes.extend(
+                    [
+                        "btc_higher_tf_local_lake_partial_window",
+                        "btc_higher_tf_local_minute_aggregation_fallback",
+                    ]
+                )
+            else:
+                notes.extend(
+                    [
+                        "btc_higher_tf_local_lake_missing_required_window",
+                        "btc_higher_tf_local_minute_aggregation_fallback",
+                    ]
+                )
 
         def local_can_serve(local_frame: pl.DataFrame) -> bool:
             return aggregate_canonical_frame(local_frame, spec, limit=limit).height >= limit
@@ -1361,12 +1615,12 @@ class LiveDataApiService:
             self._local_symbol_allow_binance_patch
             and not self._local_symbol_require_full_coverage
         )
-        notes: list[str] = []
 
         if not patch_enabled:
             local_frame = self._repository.load_canonical_minutes(symbol, start_time, resolved_end)
             if not local_can_serve(local_frame):
                 return None, [
+                    *notes,
                     f"{note_prefix}_missing_required_window",
                     f"{note_prefix}_coverage_incomplete_fallback_to_binance",
                 ]
@@ -1385,6 +1639,7 @@ class LiveDataApiService:
                 extra={"symbol": symbol, "timeframe": spec.api_name, "error": str(exc)},
             )
             return None, [
+                *notes,
                 f"{note_prefix}_missing_required_window",
                 f"{note_prefix}_coverage_incomplete_fallback_to_binance",
             ]
@@ -1392,6 +1647,7 @@ class LiveDataApiService:
         aggregate = aggregate_canonical_frame(window.frame, spec, limit=limit)
         if aggregate.height < limit:
             return None, [
+                *notes,
                 f"{note_prefix}_missing_required_window",
                 f"{note_prefix}_coverage_incomplete_fallback_to_binance",
             ]
@@ -1585,7 +1841,7 @@ class LiveDataApiService:
         resolved_end = self.resolve_end_time(coin=coin, end_time=end_time)
         symbol = normalize_symbol(coin)
         started_at = perf_counter()
-        if self._is_local_only_btc_symbol(symbol):
+        if self._btc_uses_local_only_path(symbol):
             return self._load_btc_local_only_bars(
                 coin=coin,
                 spec=spec,
@@ -1853,7 +2109,7 @@ class LiveDataApiService:
             timeframe_requests=timeframe_requests,
             effective_limits=effective_limits,
             plan=plan,
-            native_candle_calls_enabled=not self._is_local_only_btc_symbol(symbol),
+            native_candle_calls_enabled=not self._btc_uses_local_only_path(symbol),
         )
         LOGGER.info(
             "Perpetual data fetch plan selected",

@@ -24,6 +24,14 @@ LOGGER = logging.getLogger(__name__)
 # limiters don't serialize each other.  8 groups cover all FAPI endpoints used
 # to build a canonical minute frame.
 _NUM_CLIENTS = 8
+_VISION_CANONICAL_STREAMS = (
+    "klines",
+    "markPriceKlines",
+    "indexPriceKlines",
+    "aggTrades",
+    "bookTicker",
+    "metrics",
+)
 
 
 class ParallelLiveBinanceProvider:
@@ -32,8 +40,8 @@ class ParallelLiveBinanceProvider:
     Fires all independent FAPI endpoint groups concurrently by giving each
     group its own BinanceRESTClient instance (and therefore its own rate
     limiter).  For typical live windows (< 1 500 minutes, single page per
-    endpoint) this cuts the REST-fetch phase from ~1.5–2.5 s down to
-    ~200–500 ms — the slowest parallel group, not the sum of all groups.
+    endpoint) this cuts the REST-fetch phase from ~1.5-2.5 s down to
+    ~200-500 ms - the slowest parallel group, not the sum of all groups.
 
     Parallel groups
     ---------------
@@ -160,7 +168,9 @@ class ParallelLiveBinanceProvider:
             else:
                 oi = rest["open_interest"]
                 if oi is not None:
-                    mark_price = float(pi["mark_price"]) if pi is not None and pi.get("mark_price") is not None else None
+                    mark_price = (
+                        float(pi["mark_price"]) if pi is not None and pi.get("mark_price") is not None else None
+                    )
                     oi_contracts = float(oi["open_interest"])
                     metrics_rows.append(
                         {
@@ -355,6 +365,14 @@ class ParallelLiveBinanceProvider:
     def fetch_native_premium_index_snapshot(self, symbol: str) -> dict:
         return self._clients[4].fetch_premium_index(symbol)
 
+    def delete_cached_vision_files(self, symbol: str, start_time: datetime, end_time: datetime) -> int:
+        return self._vision_loader.delete_cached_files(
+            symbol,
+            floor_to_minute(start_time.astimezone(UTC)),
+            floor_to_minute(end_time.astimezone(UTC)),
+            streams=_VISION_CANONICAL_STREAMS,
+        )
+
     # ------------------------------------------------------------------ #
     # Parallel REST orchestration                                          #
     # ------------------------------------------------------------------ #
@@ -414,8 +432,8 @@ class ParallelLiveBinanceProvider:
                 ),
                 [],
             ),
-            # Group 7: global LS ratio (paginated) then funding rate (single) —
-            # two sequential calls on one client, ~200–300 ms for small windows.
+            # Group 7: global LS ratio (paginated) then funding rate (single)
+            # two sequential calls on one client, ~200-300 ms for small windows.
             "global_and_funding": lambda: self._fetch_global_and_funding(
                 self._clients[7], symbol, ls_start, ls_end, funding_start, end_utc
             ),
@@ -625,7 +643,13 @@ class ParallelLiveBinanceProvider:
         rows: list[dict] = []
         cursor = start_time
         for _ in range(200):
-            batch = client.fetch_open_interest_hist(symbol, period="5m", start_time=cursor, end_time=end_time, limit=500)
+            batch = client.fetch_open_interest_hist(
+                symbol,
+                period="5m",
+                start_time=cursor,
+                end_time=end_time,
+                limit=500,
+            )
             if not batch:
                 break
             rows.extend(batch)

@@ -344,24 +344,84 @@ def test_service_merges_local_rows_over_provider_rows(tmp_path: Path) -> None:
     local_frame = _canonical_frame(local_rows)
     _write_partition(tmp_path, symbol, start.replace(minute=0), local_frame)
 
-    class GuardProvider:
+    remote_rows = [
+        {
+            "timestamp": start,
+            "open": 90.0,
+            "high": 91.0,
+            "low": 89.0,
+            "close": 90.5,
+            "volume_btc": 2.0,
+            "volume_usdt": 1800.0,
+            "trade_count": 20,
+            "taker_buy_vol_btc": 1.0,
+            "taker_buy_vol_usdt": 900.0,
+            "has_depth": False,
+            "update_id_start": None,
+            "update_id_end": None,
+            "mark_price_open": 90.0,
+            "mark_price_close": 90.0,
+            "index_price_open": 90.0,
+            "index_price_close": 90.0,
+        },
+        {
+            "timestamp": start - timedelta(minutes=1),
+            "open": 89.0,
+            "high": 90.0,
+            "low": 88.0,
+            "close": 89.5,
+            "volume_btc": 1.0,
+            "volume_usdt": 890.0,
+            "trade_count": 10,
+            "taker_buy_vol_btc": 0.5,
+            "taker_buy_vol_usdt": 445.0,
+            "mark_price_open": 89.0,
+            "mark_price_close": 89.0,
+            "index_price_open": 89.0,
+            "index_price_close": 89.0,
+        },
+        {
+            "timestamp": start + timedelta(minutes=1),
+            "open": 101.0,
+            "high": 102.0,
+            "low": 100.0,
+            "close": 101.5,
+            "volume_btc": 1.5,
+            "volume_usdt": 1500.0,
+            "trade_count": 15,
+            "taker_buy_vol_btc": 0.7,
+            "taker_buy_vol_usdt": 700.0,
+            "mark_price_open": 101.0,
+            "mark_price_close": 101.0,
+            "index_price_open": 101.0,
+            "index_price_close": 101.0,
+        },
+    ]
+
+    class PatchProvider:
         def build_canonical_minutes(
             self,
             requested_symbol: str,
             start_time: datetime,
             end_time: datetime,
         ) -> pl.DataFrame:
-            raise AssertionError("BTC should not merge missing minutes from Binance")
+            assert requested_symbol == symbol
+            assert start_time == start - timedelta(minutes=1)
+            assert end_time == start + timedelta(minutes=1)
+            return _canonical_frame(remote_rows)
 
         def close(self) -> None:
             return None
 
+    state_store = SQLiteStateStore(tmp_path / "state.sqlite")
+    state_store.initialize()
     service = LiveDataApiService(
         repository=MinuteLakeRepository(tmp_path),
-        provider=GuardProvider(),
+        provider=PatchProvider(),
         default_limit=3,
         max_limit=10,
         on_demand_max_minutes=60,
+        state_store=state_store,
     )
 
     payload = service.fetch_perpetual_data(
@@ -371,13 +431,229 @@ def test_service_merges_local_rows_over_provider_rows(tmp_path: Path) -> None:
         end_time="2026-01-15T10:01:00Z",
     )
 
-    assert payload["source"] == "local"
-    assert len(payload["data"]["1m"]) == 1
+    assert payload["source"] == "local+binance"
+    assert len(payload["data"]["1m"]) == 2
     local_row = payload["data"]["1m"][0]
     assert local_row["timestamp"] == "2026-01-15T10:00:00.000Z"
+    assert local_row["open"] == 100.0
     assert local_row["has_depth"] is True
     assert local_row["update_id_start"] == 111
     assert local_row["update_id_end"] == 222
+    assert payload["data"]["1m"][1]["timestamp"] == "2026-01-15T10:01:00.000Z"
+
+    class GuardProvider:
+        def build_canonical_minutes(self, *args: object, **kwargs: object) -> pl.DataFrame:
+            raise AssertionError("persisted missing rows should avoid another Binance patch")
+
+        def close(self) -> None:
+            return None
+
+    persisted_service = LiveDataApiService(
+        repository=MinuteLakeRepository(tmp_path),
+        provider=GuardProvider(),
+        default_limit=3,
+        max_limit=10,
+        on_demand_max_minutes=60,
+    )
+    persisted_payload = persisted_service.fetch_perpetual_data(
+        coin="btc",
+        tfs="1m",
+        limit=2,
+        end_time="2026-01-15T10:01:00Z",
+    )
+    assert persisted_payload["source"] == "local"
+    assert persisted_payload["data"]["1m"][0]["open"] == 100.0
+    assert persisted_payload["data"]["1m"][1]["timestamp"] == "2026-01-15T10:01:00.000Z"
+
+
+def test_btc_binance_patch_materializes_to_primary_minute_lake_and_prunes_vision_cache(tmp_path: Path) -> None:
+    symbol = "BTCUSDT"
+    start = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
+    rows = [
+        {
+            "timestamp": start + timedelta(minutes=minute - 1),
+            "open": 100.0 + minute,
+            "high": 101.0 + minute,
+            "low": 99.0 + minute,
+            "close": 100.5 + minute,
+            "volume_btc": 1.0,
+            "volume_usdt": 100.0,
+            "trade_count": 1,
+            "taker_buy_vol_btc": 0.5,
+            "taker_buy_vol_usdt": 50.0,
+            "mark_price_open": 100.0 + minute,
+            "mark_price_close": 100.5 + minute,
+            "index_price_open": 100.0 + minute,
+            "index_price_close": 100.5 + minute,
+        }
+        for minute in range(3)
+    ]
+
+    class PatchProvider:
+        def __init__(self) -> None:
+            self.build_calls: list[tuple[str, datetime, datetime]] = []
+            self.delete_calls: list[tuple[str, datetime, datetime]] = []
+
+        def build_canonical_minutes(
+            self,
+            requested_symbol: str,
+            start_time: datetime,
+            end_time: datetime,
+        ) -> pl.DataFrame:
+            self.build_calls.append((requested_symbol, start_time, end_time))
+            return _canonical_frame(rows)
+
+        def delete_cached_vision_files(self, requested_symbol: str, start_time: datetime, end_time: datetime) -> int:
+            self.delete_calls.append((requested_symbol, start_time, end_time))
+            return 3
+
+        def close(self) -> None:
+            return None
+
+    provider = PatchProvider()
+    state_store = SQLiteStateStore(tmp_path / "state.sqlite")
+    state_store.initialize()
+    service = LiveDataApiService(
+        repository=MinuteLakeRepository(tmp_path),
+        provider=provider,
+        default_limit=2,
+        max_limit=10,
+        on_demand_max_minutes=60,
+        state_store=state_store,
+    )
+
+    payload = service.fetch_perpetual_data(
+        coin="btc",
+        tfs="1m",
+        limit=2,
+        end_time="2026-01-15T10:01:00Z",
+    )
+
+    assert payload["source"] == "binance"
+    assert provider.build_calls == [(symbol, start - timedelta(minutes=1), start + timedelta(minutes=1))]
+    assert provider.delete_calls == [(symbol, start - timedelta(minutes=1), start + timedelta(minutes=1))]
+    assert (
+        tmp_path
+        / "futures"
+        / "um"
+        / "minute"
+        / "symbol=BTCUSDT"
+        / "year=2026"
+        / "month=01"
+        / "day=15"
+        / "hour=10"
+        / "part.parquet"
+    ).exists()
+
+
+def test_non_btc_binance_patch_materializes_to_flattened_cache_lake(tmp_path: Path) -> None:
+    symbol = "ETHUSDT"
+    main_root = tmp_path / "data"
+    cache_root = tmp_path / ".cache" / "canonical_lake"
+    start = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
+    rows = [
+        {
+            "timestamp": start + timedelta(minutes=minute - 1),
+            "open": 2000.0 + minute,
+            "high": 2010.0 + minute,
+            "low": 1990.0 + minute,
+            "close": 2005.0 + minute,
+            "volume_btc": 1.0,
+            "volume_usdt": 2000.0,
+            "trade_count": 1,
+            "taker_buy_vol_btc": 0.5,
+            "taker_buy_vol_usdt": 1000.0,
+            "mark_price_open": 2000.0 + minute,
+            "mark_price_close": 2005.0 + minute,
+            "index_price_open": 1999.0 + minute,
+            "index_price_close": 2004.0 + minute,
+        }
+        for minute in range(3)
+    ]
+
+    class PatchProvider:
+        def __init__(self) -> None:
+            self.build_calls = 0
+            self.delete_calls = 0
+
+        def build_canonical_minutes(
+            self,
+            requested_symbol: str,
+            start_time: datetime,
+            end_time: datetime,
+        ) -> pl.DataFrame:
+            assert requested_symbol == symbol
+            self.build_calls += 1
+            return _canonical_frame(rows)
+
+        def delete_cached_vision_files(self, requested_symbol: str, start_time: datetime, end_time: datetime) -> int:
+            assert requested_symbol == symbol
+            self.delete_calls += 1
+            return 2
+
+        def close(self) -> None:
+            return None
+
+    cache_state_store = SQLiteStateStore(cache_root / "state.sqlite")
+    cache_state_store.initialize()
+    provider = PatchProvider()
+    service = LiveDataApiService(
+        repository=MinuteLakeRepository(main_root),
+        provider=provider,
+        default_limit=2,
+        max_limit=10,
+        on_demand_max_minutes=60,
+        canonical_cache_repository=MinuteLakeRepository(cache_root),
+        canonical_cache_state_store=cache_state_store,
+    )
+
+    payload = service.fetch_perpetual_data(
+        coin="eth",
+        tfs="1m",
+        limit=2,
+        end_time="2026-01-15T10:01:00Z",
+    )
+
+    assert payload["source"] == "binance"
+    assert provider.build_calls == 1
+    assert provider.delete_calls == 1
+    assert (
+        cache_root
+        / "futures"
+        / "um"
+        / "minute"
+        / "symbol=ETHUSDT"
+        / "year=2026"
+        / "month=01"
+        / "day=15"
+        / "hour=10"
+        / "part.parquet"
+    ).exists()
+
+    class GuardProvider:
+        def build_canonical_minutes(self, *args: object, **kwargs: object) -> pl.DataFrame:
+            raise AssertionError("flattened cache lake should satisfy the second request")
+
+        def close(self) -> None:
+            return None
+
+    cached_service = LiveDataApiService(
+        repository=MinuteLakeRepository(main_root),
+        provider=GuardProvider(),
+        default_limit=2,
+        max_limit=10,
+        on_demand_max_minutes=60,
+        canonical_cache_repository=MinuteLakeRepository(cache_root),
+        canonical_cache_state_store=cache_state_store,
+    )
+    cached_payload = cached_service.fetch_perpetual_data(
+        coin="eth",
+        tfs="1m",
+        limit=2,
+        end_time="2026-01-15T10:01:00Z",
+    )
+    assert cached_payload["source"] == "cache"
+    assert cached_payload["data"]["1m"][0]["timestamp"] == "2026-01-15T10:00:00.000Z"
 
 
 def test_service_uses_shared_minute_lake_live_store_for_btc_without_ws_warmup(tmp_path: Path) -> None:
@@ -1611,7 +1887,7 @@ def test_btc_prefers_local_minute_lake_when_coverage_exists(tmp_path: Path) -> N
     assert payload["data"]["5m"][0]["update_id_start"] == 10
 
 
-def test_btc_local_fastpath_does_not_fall_back_to_binance_when_local_missing(tmp_path: Path) -> None:
+def test_btc_local_only_config_does_not_fall_back_to_binance_when_local_missing(tmp_path: Path) -> None:
     class GuardProvider:
         def fetch_native_candles(self, *args: object, **kwargs: object) -> list[dict[str, object]]:
             raise AssertionError("BTC should not fall back to Binance candles")
@@ -1628,6 +1904,7 @@ def test_btc_local_fastpath_does_not_fall_back_to_binance_when_local_missing(tmp
         default_limit=20,
         max_limit=500,
         on_demand_max_minutes=60_480,
+        btc_allow_binance_patch=False,
     )
     client = TestClient(create_app(service))
 
@@ -1644,6 +1921,93 @@ def test_btc_local_fastpath_does_not_fall_back_to_binance_when_local_missing(tmp
     assert "local_btc_missing_required_window" in metadata["notes"]
     assert "btc_local_only_no_binance_fallback" in metadata["notes"]
     assert payload["data"]["5m"] == []
+
+
+def test_btc_missing_local_window_patches_from_binance_and_persists(tmp_path: Path) -> None:
+    symbol = "BTCUSDT"
+    start = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)
+    remote_rows = [
+        {
+            "timestamp": start - timedelta(minutes=1) + timedelta(minutes=minute),
+            "open": 100.0 + minute,
+            "high": 101.0 + minute,
+            "low": 99.0 + minute,
+            "close": 100.5 + minute,
+            "volume_btc": 1.0,
+            "volume_usdt": 100.0,
+            "trade_count": 1,
+            "taker_buy_vol_btc": 0.5,
+            "taker_buy_vol_usdt": 50.0,
+            "mark_price_open": 100.0 + minute,
+            "mark_price_close": 100.0 + minute,
+            "index_price_open": 100.0 + minute,
+            "index_price_close": 100.0 + minute,
+        }
+        for minute in range(3)
+    ]
+    provider_calls: list[tuple[str, datetime, datetime]] = []
+
+    class PatchProvider:
+        def build_canonical_minutes(
+            self,
+            requested_symbol: str,
+            start_time: datetime,
+            end_time: datetime,
+        ) -> pl.DataFrame:
+            provider_calls.append((requested_symbol, start_time, end_time))
+            return _canonical_frame(remote_rows)
+
+        def close(self) -> None:
+            return None
+
+    state_store = SQLiteStateStore(tmp_path / "state.sqlite")
+    state_store.initialize()
+    service = LiveDataApiService(
+        repository=MinuteLakeRepository(tmp_path),
+        provider=PatchProvider(),
+        default_limit=20,
+        max_limit=500,
+        on_demand_max_minutes=60_480,
+        state_store=state_store,
+    )
+    client = TestClient(create_app(service))
+
+    response = client.get(
+        "/api/v1/perpetual-data",
+        params={"coin": "BTC", "tfs": "1m=2", "end_time": "2026-01-15T10:01:00Z"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    metadata = payload["timeframe_metadata"]["1m"]
+    assert provider_calls == [(symbol, start - timedelta(minutes=1), start + timedelta(minutes=1))]
+    assert payload["source"] == "binance"
+    assert metadata["fallback_used"] is True
+    assert "local_btc_coverage_incomplete_patched_from_binance" in metadata["notes"]
+
+    class GuardProvider:
+        def build_canonical_minutes(self, *args: object, **kwargs: object) -> pl.DataFrame:
+            raise AssertionError("persisted BTC patch should be read from the local minute lake")
+
+        def close(self) -> None:
+            return None
+
+    persisted_service = LiveDataApiService(
+        repository=MinuteLakeRepository(tmp_path),
+        provider=GuardProvider(),
+        default_limit=20,
+        max_limit=500,
+        on_demand_max_minutes=60_480,
+    )
+    persisted_payload = persisted_service.fetch_perpetual_data(
+        coin="BTC",
+        tfs="1m=2",
+        end_time="2026-01-15T10:01:00Z",
+    )
+
+    assert persisted_payload["source"] == "local"
+    assert len(persisted_payload["data"]["1m"]) == 2
+    assert persisted_payload["data"]["1m"][0]["timestamp"] == "2026-01-15T10:00:00.000Z"
 
 
 def test_btc_higher_timeframe_at_complexity_threshold_stays_local(tmp_path: Path) -> None:
